@@ -1,4 +1,5 @@
-#!/usr/bin/perl
+#!/opt/local/bin/perl
+# #!/usr/bin/perl
 #		ff3histview
 # A script that reads the places.sqlite database that Firefox creates and displays 
 # the content of the database in a human readable format
@@ -7,18 +8,20 @@
 # site : http://www.firefoxforensics.com/
 #
 # Author: Kristinn Gudjonsson
-# Version: 0.3
-# Date : 07/09/09
+# Version: 0.4
+# Date : 06/04/10
 #
+# Added few details that are specific to Jurica Seva
+# 
 # Copyright 2009 Kristinn Gudjonsson ( kristinn ( a t ) log2timeline (d o t ) net )
 # Sort order added by : Richard Monk ( rmonk ( a t ) redhat ( d o t ) com )
 #
 use strict;
 use DBI;
-use Time::localtime;
 use Getopt::Long; # read parameters
 use Encode;
 use File::Copy;
+use DateTime;
 
 # various
 my $cnr;
@@ -31,6 +34,7 @@ my $db_lock = 0;
 my $sort = 'date';
 my $revsort;
 my $sortorder;
+my $do_rec = 0;	# defines if we are in a recursive search
 
 # for printing
 my $print_csv;
@@ -42,6 +46,7 @@ my $print_help;
 my $url;
 my $from_visit;
 my $date;
+my $time;
 my $visit_type;
 my $time_offset = 0;
 my $hostname;
@@ -49,12 +54,16 @@ my @from;
 my $show_hidden = 0;
 my $only_typed = 0;
 
-my $db_file;
+my $file_read;
 my $db;
 my $sql;
 my $result;
 my @dump;
 my $sth;
+my $sep;	# the separator used
+my $tmploc;	# the location of the temporary folder
+my $sID; 	# a session ID
+my $uID;	# a user ID
 
 if( $ARGV < 0 )
 {
@@ -76,6 +85,18 @@ GetOptions( "t:s"=> \$time_offset,
 	"sort:s"=> \$sort, 
 	"r"=>\$revsort );
 
+# check the OS for the separator stuff
+if( $^O eq "MSWin32" )
+{
+	#print STDERR "WINDOWS ($^O)\n";
+	$sep = "\\";
+	$tmploc = 'C:\\';
+}
+else
+{
+	$sep = '/';
+	$tmploc = '/tmp';
+}
 
 # check the print status, we have a preference and only one is active
 if( $print_txt )
@@ -114,123 +135,83 @@ if( $print_help )
 }
 
 # read the database file
-$db_file = $ARGV[0];
+$file_read= shift;
 
-# check the file if it exists
-if( !-e $db_file )
+# start by checking, is this a directory or a file
+if( -d $file_read)
+{	
+	# we have a directory
+	print STDERR "Recursively searching through the directory for history files\n";
+	print STDERR "Recursive search indicates a CSV output.\n";
+	$print_txt = 0;
+	$print_html = 0;
+	$print_csv = 1;
+	$quiet = 1;
+	$do_rec	= 1;	# we are recursively going through our stuff
+
+	# print the header information
+	if( $show_hidden )
+	{
+		# we need to add one more header to the equation
+		print "id,userID,sessionID,URL,Title,Count,Date,Time,From,Hostname,Hidden\n";
+	}
+	else
+	{
+		print "id,userID,sessionID,URL,Title,Count,Date,Time,From,Hostname\n";
+	}
+
+	# and now to recursively search
+	parse_dir( $file_read);
+
+}
+elsif( -f $file_read )
 {
-	print STDERR "File $db_file does not exist.\n";
+	# check to see if we are printing using CSV
+	if( $print_csv )
+	{
+		# print the header information
+		if( $show_hidden )
+		{
+			# we need to add one more header to the equation
+			print "id,URL,Title,Count,Date,Time,From,Hostname,Hidden\n";
+		}
+		else
+		{
+			print "id,URL,Title,Count,Date,Time,From,Hostname\n";
+		}
+	}
+
+	# we have a file
+	print_header();
+	parse_file($file_read);
+}
+else
+{
+	# not a file, and not a directory, error
+	print STDERR "File $file_read does not exist.\n";
 	print_help();
 	exit 2;
 }
 
-if ( -e "$db_file-journal" )
+
+sub print_header()
 {
-	# create a new variable to store the temp location
-	my $temp = rand();
-	$temp = "/tmp/tmp$temp.db";
-
-	print STDERR "Database is locked:\nCopy the file to a different location and try again\n";
-	# we need to copy the file to a temp location and start again
-	copy( $db_file, $temp ) || die( "Unable to copy database file to a temp location, $temp" );
-	$db_file = $temp;
-
-	# indicate that the database is locked.
-	$db_lock = 1;
-}
-
-# connect to the database
-$db = DBI->connect("dbi:SQLite:dbname=$db_file","","") || die( "Unable to connect to database\n" );
-
-# check if this is real Firefox database
-$db->prepare( 'SELECT id FROM moz_places LIMIT 1' ) || die( "The database is not a correct Firefox database" );
-
-# we now know that we have a FireFox SQLITE database, let's continue
-
-# start by checking out the variable time_offset (possible to use INTh to indicate hours, and INTm to indicate minutes)
-if( $time_offset =~ m/h$/ )
-{
-	# the input is in hours, so modify it to represent seconds
-
-	# modify the offset
-
-	# chop of the last character (the h representing hour)
-	chop( $time_offset );
-	if ( $time_offset =~ m/^-?\d+$/ )
+	# check to see if we need to read parameters
+	if( !$quiet )
 	{
-		# now  we've confirmed that we are dealing with a number, let's multiply
-		$time_offset = $time_offset * 3600;
+		# now we need to ask questions
+		print "Enter case number: ";
+		$cnr = <STDIN>;
+		print "Case reference: ";
+		$cref = <STDIN>;
+		print "Investigator name: ";
+		$cinves = <STDIN>;
 	}
-	else
+
+	# check if we are print using HTML
+	if( $print_html )
 	{
-		# the time offset is badly formed, not XXXh where XXX is an integer
-		print STDERR "Time offset is badly formed\n";
-		$time_offset = 0;
-	}
-}
-
-# check to see if the time offset is appended with m, for minutes
-if( $time_offset =~ m/m$/ )
-{
-	# modify the offset
-	chop( $time_offset );
-	if ( $time_offset =~ m/^-?\d+$/ )
-	{
-		$time_offset = $time_offset * 60;
-	}
-	else
-	{
-		print STDERR "Time offset is badly formed\n";
-		$time_offset = 0;
-	}
-}
-
-# and if someone added s to represent seconds
-if( $time_offset =~ m/s$/ )
-{
-	# just chop off the s for seconds
-	chop( $time_offset );
-}
-
-##################################################################
-# the structure/schema of the moz_places table
-##################################################################
-# id INTEGER PRIMARY KEY
-# url LONGVARCHAR
-# title LONGVARCHAR
-# rev_host LONGVARCHAR
-# visit_count INTEGER DEFAULT 0
-# hidden INTEGER DEFAULT 0 NOT NULL, 
-# typed INTEGER DEFAULT 0 NOT NULL, 
-# favicon_id INTEGER, 
-# frecency INTEGER DEFAULT -1 NOT NULL
-
-# structure of moz_historyvisits
-# id INTEGER PRIMARY KEY
-# from_visit INTEGER
-# place_id INTEGER
-# visit_date INTEGER
-# visit_type INTEGER
-# session INTEGER
-#-----------------------------------------------------------------
-
-
-# check to see if we need to read parameters
-if( !$quiet )
-{
-	# now we need to ask questions
-	print "Enter case number: ";
-	$cnr = <STDIN>;
-	print "Case reference: ";
-	$cref = <STDIN>;
-	print "Investigator name: ";
-	$cinves = <STDIN>;
-}
-
-# check if we are print using HTML
-if( $print_html )
-{
-	print "
+		print "
 <html>
 <head>
 	<title>Firefox History</title>
@@ -240,37 +221,37 @@ if( $print_html )
 <h1 align=\"center\">Firefox history</h1>
 <br />
 <ul>
-	";
-	if( !$quiet )
-	{
-		print "
+		";
+		if( !$quiet )
+		{
+			print "
 	<li>Case number: $cnr</li>
 	<li>Case reference: $cref</li>
 	<li>Investigator: $cinves</li>
-		";
-	}
+			";
+		}
 
-	if ( $db_lock )
-	{
-		print "
+		if ( $db_lock )
+		{
+			print "
 <li>The history file is locked so a copy of the database has been made and the copy is being read</li>
 <li>[WARNING] We might not have the entire history file since Firefox is either still open or exited without flushing the journal</li>
-<li>This history file is taken from the file $db_file (temp location)</li>\n";
-	}
-	if( $only_typed )
-	{
-		print "
+<li>This history file is taken from the file $file_read (temp location)</li>\n";
+		}
+		if( $only_typed )
+		{
+			print "
 <li>The script outputs only URLs that have been directly typed by the user into the location/URL bar (typed = 1)</li>
-		";
-	}
-	elsif( $show_hidden )
-	{
-		print "
+			";
+		}
+		elsif( $show_hidden )
+		{
+			print "
 <li>The script displays \"hidden\" URLs as well as others, that is a URL that the user did not specifically navigate to</li>
-		";
-	}
+			";
+		}
 
-	print "
+		print "
 	<li>Date of run (GMT): ", get_time() , "</li>
 	<li>Time offset of history file: ", $time_offset, "s</li>
 </ul>
@@ -286,169 +267,261 @@ if( $print_html )
 	<th width=\"200\">Notes</th>
 </tr>
 	";
-}
-
-# check to see if we are printing using CSV
-if( $print_csv )
-{
-	# print the header information
-	if( $show_hidden )
-	{
-		# we need to add one more header to the equation
-		print "id,URL,Title,Count,Date,From,Hostname,Hidden\n";
 	}
-	else
-	{
-		print "id,URL,Title,Count,Date,From,Hostname\n";
-	}
-}
 
-if ( $print_txt )
-{
-	print "Firefox 3 History Viewer\n";
-
-	if( !$quiet )
+	if ( $print_txt )
 	{
-		print "
+		print "Firefox 3 History Viewer\n";
+
+		if( !$quiet )
+		{
+			print "
 Case number: $cnr
 Case reference: $cref
 Investigator: $cinves
-		";
-	}
+			";
+		}
 
-	if( $only_typed )
-	{
-		print "Only showing directly typed in URLs\n";
-	}
-	elsif( $show_hidden )
-	{
-		print "Showing hidden URLs as well\n";
-	}
-	else
-	{
-		print "Not showing 'hidden' URLS, that is URLs that the user did not specifically navigate to, use -s to show them\n";
-	}
-
-	print "
+		if( $only_typed )
+		{
+			print "Only showing directly typed in URLs\n";
+		}
+		elsif( $show_hidden )
+		{
+			print "Showing hidden URLs as well\n";
+		}
+		else
+		{
+			print "Not showing 'hidden' URLS, that is URLs that the user did not specifically navigate to, use -s to show them\n";
+		}
+	
+		print "
 Date of run (GMT): ", get_time(), "
 Time offset of history file: $time_offset s
 
 -------------------------------------------------------
 Date\t\t\t\tCount\tHost name\tURL\tnotes\n";
+	}
 }
 
-# Construct the SQL statement to extract the needed data
-if( $only_typed )
+# a routine to parse a file
+sub parse_file($)
 {
-	$sql = "
+	my $db_file = shift;
+
+	#print STDERR "NOW PARSING FILE $db_file\n";
+
+	if ( -e "$db_file-journal" )
+	{
+		# create a new variable to store the temp location
+		my $temp = rand();
+		$temp = $tmploc . $sep . "tmp$temp.db";
+	
+		print STDERR "Database is locked:\nCopy the file to a different location and try again\n";
+		# we need to copy the file to a temp location and start again
+		copy( $db_file, $temp ) || die( "Unable to copy database file to a temp location, $temp" );
+		$db_file = $temp;
+	
+		# indicate that the database is locked.
+		$db_lock = 1;
+	}
+
+	# connect to the database
+	$db = DBI->connect("dbi:SQLite:dbname=$db_file","","") || die( "Unable to connect to database\n" );
+
+	# check if this is real Firefox database
+	$db->prepare( 'SELECT id FROM moz_places LIMIT 1' ) || die( "The database is not a correct Firefox database" );
+
+	# we now know that we have a FireFox SQLITE database, let's continue
+
+	# start by checking out the variable time_offset (possible to use INTh to indicate hours, and INTm to indicate minutes)
+	if( $time_offset =~ m/h$/ )
+	{
+		# the input is in hours, so modify it to represent seconds
+
+		# modify the offset
+
+		# chop of the last character (the h representing hour)
+		chop( $time_offset );
+		if ( $time_offset =~ m/^-?\d+$/ )
+		{
+			# now  we've confirmed that we are dealing with a number, let's multiply
+			$time_offset = $time_offset * 3600;
+		}
+		else
+		{
+			# the time offset is badly formed, not XXXh where XXX is an integer
+			print STDERR "Time offset is badly formed\n";
+			$time_offset = 0;
+		}
+	}
+
+	# check to see if the time offset is appended with m, for minutes
+	if( $time_offset =~ m/m$/ )
+	{
+		# modify the offset
+		chop( $time_offset );
+		if ( $time_offset =~ m/^-?\d+$/ )
+		{
+			$time_offset = $time_offset * 60;
+		}
+		else
+		{
+			print STDERR "Time offset is badly formed\n";
+			$time_offset = 0;
+		}
+	}
+	
+	# and if someone added s to represent seconds
+	if( $time_offset =~ m/s$/ )
+	{
+		# just chop off the s for seconds
+		chop( $time_offset );
+	}
+	
+	##################################################################
+	# the structure/schema of the moz_places table
+	##################################################################
+	# id INTEGER PRIMARY KEY
+	# url LONGVARCHAR
+	# title LONGVARCHAR
+	# rev_host LONGVARCHAR
+	# visit_count INTEGER DEFAULT 0
+	# hidden INTEGER DEFAULT 0 NOT NULL, 
+	# typed INTEGER DEFAULT 0 NOT NULL, 
+	# favicon_id INTEGER, 
+	# frecency INTEGER DEFAULT -1 NOT NULL
+	
+	# structure of moz_historyvisits
+	# id INTEGER PRIMARY KEY
+	# from_visit INTEGER
+	# place_id INTEGER
+	# visit_date INTEGER
+	# visit_type INTEGER
+	# session INTEGER
+	#-----------------------------------------------------------------
+
+
+	# Construct the SQL statement to extract the needed data
+	if( $only_typed )
+	{
+		$sql = "
 SELECT moz_historyvisits.id,url,title,visit_count,visit_date,from_visit,rev_host
 FROM moz_places, moz_historyvisits
 WHERE
 	moz_places.id = moz_historyvisits.place_id
 	AND moz_places.typed = 1
 	";
-}
-elsif( $show_hidden )
-{
-	$sql = "
+	}
+	elsif( $show_hidden )
+	{
+		$sql = "
 SELECT moz_historyvisits.id,url,title,visit_count,visit_date,from_visit,rev_host,hidden
 FROM moz_places, moz_historyvisits
 WHERE
 	moz_places.id = moz_historyvisits.place_id
 	";
-}
-else
-{
-	$sql = "
+	}
+	else
+	{
+		$sql = "
 SELECT moz_historyvisits.id,url,title,visit_count,visit_date,from_visit,rev_host
 FROM moz_places, moz_historyvisits
 WHERE
 	moz_places.id = moz_historyvisits.place_id
 	AND hidden = 0
 	";
-}
-
-# Add in the sort method
-$sortorder=" ASC";
-if( $revsort ) { $sortorder=" DESC"; }
-
-if( $sort eq "date" ) { $sql.=" ORDER BY visit_date" . $sortorder; }
-elsif( $sort eq "url" ) { $sql.=" ORDER BY url" . $sortorder . ",visit_date"; } 
-elsif( $sort eq "visits" ) { $sql.=" ORDER BY visit_count" . $sortorder . ",url,visit_date"; }
-
-
-
-$sth = $db->prepare( $sql );
-$result = $sth->execute( );
-
-# go through all of the results
-while( @dump = $sth->fetchrow_array() )
-{
-	# we need to fix the date, so we can represent it correctly
-	$date = fix_date( $dump[4] );
-
-	# get the hostname	
-	$hostname = fix_hostname( $dump[6] );
-
-	# check to see if we came to the web site from another one
-	if( $dump[5] ne 0 )
-	{
-		@from = get_url( $dump[5] );
 	}
 
-	# and then to output the data
-	if( $print_txt )
-	{
-		if( defined @from ) 
-		{
-			print "$date\t$dump[3]\t$hostname\t$dump[1]\tFrom: $from[0]\n";
-		}
-		else
-		{
-			print "$date\t$dump[3]\t$hostname\t$dump[1]\n";
-		}
-	}
-	elsif( $print_csv )
-	{
-		# sometimes the title contains comma, so delete it		
-		$dump[2] =~ s/,/\s/g;	
+	# Add in the sort method
+	$sortorder=" ASC";
+	if( $revsort ) { $sortorder=" DESC"; }
 
-		# format of the CSV file:
-		# ID,URL,Title,Count,Date,From,Hostname (,Hidden)
+	if( $sort eq "date" ) { $sql.=" ORDER BY visit_date" . $sortorder; }
+	elsif( $sort eq "url" ) { $sql.=" ORDER BY url" . $sortorder . ",visit_date"; } 
+	elsif( $sort eq "visits" ) { $sql.=" ORDER BY visit_count" . $sortorder . ",url,visit_date"; }
 
-		# check to see if we are coming from another host
-		if( defined @from )
+
+
+	$sth = $db->prepare( $sql );
+	$result = $sth->execute( );
+
+	# go through all of the results
+	while( @dump = $sth->fetchrow_array() )
+	{
+		# the desired date format:
+		#	Date 2010:02:10
+		#	Time 15:53:19
+		# we need to fix the date, so we can represent it correctly
+		($time,$date) = fix_date( $dump[4] );
+
+		# get the hostname	
+		$hostname = fix_hostname( $dump[6] );
+
+		# check to see if we came to the web site from another one
+		if( $dump[5] ne 0 )
 		{
-			if( $show_hidden )
+			@from = get_url( $dump[5] );
+		}
+
+		# and then to output the data
+		if( $print_txt )
+		{
+			if( defined @from ) 
 			{
-				print "$dump[0],$dump[1],", $dump[2], ",$dump[3],$date,$from[0],$hostname,$dump[7]\n";
-				#print "$dump[0],$dump[1],", encode( $encoding,$dump[2]), ",$dump[3],$date,$from[0],$hostname\n";
+				print "$date\t$time\t$dump[3]\t$hostname\t$dump[1]\tFrom: $from[0]\n";
 			}
 			else
 			{
-				print "$dump[0],$dump[1],", $dump[2], ",$dump[3],$date,$from[0],$hostname\n";
-				#print "$dump[0],$dump[1],", encode( $encoding,$dump[2]), ",$dump[3],$date,$from[0],$hostname\n";
+				print "$date\t$time\t$dump[3]\t$hostname\t$dump[1]\n";
 			}
 		}
-		else
+		elsif( $print_csv )
 		{
-			if( $show_hidden )
+			# sometimes the title contains comma, so delete it		
+			$dump[2] =~ s/,/\s/g;	
+
+			# format of the CSV file:
+			# ID,URL,Title,Count,Date,From,Hostname (,Hidden)
+			# ID,userID,sessionID,URL,Title,Count,Date,From,Hostname (,Hidden)
+
+			# check to see if we are coming from another host
+			if( defined @from )
 			{
-				print "$dump[0],$dump[1],",  $dump[2], ",$dump[3],$date,'',$hostname,$dump[7]\n";
-				#print "$dump[0],$dump[1],", encode( $encoding, $dump[2]), ",$dump[3],$date,'',$hostname\n";
+				if( $show_hidden )
+				{
+					print "$dump[0],$uID,$sID,$dump[1],", $dump[2], ",$dump[3],$date,$time,$from[0],$hostname,$dump[7]\n" if $do_rec;
+					print "$dump[0],$dump[1],", $dump[2], ",$dump[3],$date,$time,$from[0],$hostname,$dump[7]\n" unless $do_rec;
+					#print "$dump[0],$dump[1],", encode( $encoding,$dump[2]), ",$dump[3],$date,$from[0],$hostname\n";
+				}
+				else
+				{
+					print "$dump[0],$uID,$sID,$dump[1],", $dump[2], ",$dump[3],$date,$time,$from[0],$hostname\n" if $do_rec;
+					print "$dump[0],$dump[1],", $dump[2], ",$dump[3],$date,$time,$from[0],$hostname\n" unless $do_rec;
+					#print "$dump[0],$dump[1],", encode( $encoding,$dump[2]), ",$dump[3],$date,$from[0],$hostname\n";
+				}
 			}
 			else
-			{			
-				print "$dump[0],$dump[1],",  $dump[2], ",$dump[3],$date,'',$hostname\n";
-				#print "$dump[0],$dump[1],", encode( $encoding, $dump[2]), ",$dump[3],$date,'',$hostname\n";
+			{
+				if( $show_hidden )
+				{
+					print "$dump[0],$uID,$sID,$dump[1],",  $dump[2], ",$dump[3],$date,$time,'',$hostname,$dump[7]\n" if $do_rec;
+					print "$dump[0],$dump[1],",  $dump[2], ",$dump[3],$date,$time,'',$hostname,$dump[7]\n" unless $do_rec;
+					#print "$dump[0],$dump[1],", encode( $encoding, $dump[2]), ",$dump[3],$date,'',$hostname\n";
+				}
+				else
+				{			
+					print "$dump[0],$uID,$sID,$dump[1],",  $dump[2], ",$dump[3],$date,$time,'',$hostname\n" if $do_rec;
+					print "$dump[0],$dump[1],",  $dump[2], ",$dump[3],$date,$time,'',$hostname\n" unless $do_rec;
+					#print "$dump[0],$dump[1],", encode( $encoding, $dump[2]), ",$dump[3],$date,'',$hostname\n";
+				}
 			}
 		}
-	}
-	elsif( $print_html )
-	{
-		print "
+		elsif( $print_html )
+		{
+			print "
 <tr>
-	<td width=\"150\"><a name=\"$dump[0]\">$date</a></td>
+	<td width=\"150\"><a name=\"$dump[0]\">$date $time</a></td>
 	<td width=\"150\">$hostname</td>
 	<td width=\"400\">$dump[1]</td>
 	<td width=\"40\">$dump[3]</td>
@@ -456,48 +529,51 @@ while( @dump = $sth->fetchrow_array() )
 	<td width=\"200\">&nbsp;
 		";
 
-		# check if we've visited from somewhere else
-		if( defined @from )
-		{
-			print "
+			# check if we've visited from somewhere else
+			if( defined @from )
+			{
+				print "
 	From [<a href=\"#",$dump[5],"\">",$from[1],"]</a>
+				";
+			}
+			print "</td>
+</tr>
 			";
 		}
-		print "</td>
-</tr>
-		";
+		else
+		{
+			# should not get here
+			print "No output chosen, printing nothing (for each entry)\n";
+		}
 	}
-	else
+
+
+	# if we are using a HTML report, close the table
+	if( $print_html )
 	{
-		# should not get here
-		print "No output chosen, printing nothing (for each entry)\n";
-	}
-}
-
-
-# if we are using a HTML report, close the table
-if( $print_html )
-{
-	print "
+		print "
 </table>
 <br />
 Web page printed using $0
 </body>
 </html>
-	";
+		";
+	}
+
+	if ($print_txt )
+	{
+		print "-------------------------------------------------------\n";
+	}
+
+	# check to see if database is locked, then delete temp file
+	if( $db_lock )
+	{
+		print STDERR "Deleting temporary history file, $db_file \n";
+		unlink( $db_file );
+	}
 }
 
-if ($print_txt )
-{
-	print "-------------------------------------------------------\n";
-}
 
-# check to see if database is locked, then delete temp file
-if( $db_lock )
-{
-	print STDERR "Deleting temporary history file, $db_file \n";
-	unlink( $db_file );
-}
 
 # functions
 
@@ -513,6 +589,7 @@ sub get_url
 	my $s_url;
 	my $s_host;
 	my $s_date;
+	my $s_time;
 	my @return;
 	
 	# construct the SQL statement
@@ -532,12 +609,13 @@ WHERE
 
 	# fix variables
 	$s_host = fix_hostname( $s_host );	
-	$s_date = fix_date( $s_date );
+	($s_time, $s_date ) = fix_date( $s_date );
 	
 	# push variables to return array
 	push( @return, $s_url );
 	push( @return, $s_host );
 	push( @return, $s_date );
+	push( @return, $s_time );
 
 	return @return;
 }
@@ -576,6 +654,9 @@ sub fix_date
 {
 	# read the parameter
 	my $s_date = $_[0];
+	my $dt;
+	my @ret;
+	my $t;
 
 	# check to see if the time offset variable is correctly formatted
 	# this variable contains the user input of time scew from the 
@@ -592,7 +673,19 @@ sub fix_date
 		$s_date = $s_date  / 1000000;
 	}
 
-	return ctime( $s_date );
+	# now we have the timestamp, let's figure out the rest
+	$dt = DateTime->from_epoch( epoch => $s_date );
+
+	# we are returning two variables, date and time
+	# the desired format is:
+	#	Date 2010:02:10
+	#	Time 15:53:19
+	$t = sprintf "%0.2d:%0.2d:%0.2d", $dt->hour, $dt->minute, $dt->second;
+	push( @ret, $t );
+	$t = sprintf "%0.4d:%0.2d:%0.2d", $dt->year, $dt->month, $dt->day;
+	push( @ret, $t );
+
+	return @ret;
 }
 
 #	get_time
@@ -624,6 +717,212 @@ sub get_time
 
 	return $time;
 }
+
+# a simple function that either returns a zero (not a firefox history file) or one (a firefox history file)
+sub verify($)
+{
+        # define an array to keep
+        my $line;
+        my @words;
+        my $temp;
+        my $magic = 'SQLite format 3';
+        my $file = shift;
+        my ($vdb,$vsth);
+        my $file_lock = 0;
+        my $db;
+	my $ret = 0;
+
+        return 0 unless -f $$file;
+
+        # open the file (at least try to open it)
+        eval
+        {
+                open( FILE, $$file );
+                binmode(FILE);
+
+        };
+        if( $@ )
+        {
+		print STDERR "Unable to open file\n";
+		return 0;
+        }
+
+        # check the first bit, it has to match the magic value before proceeding
+        seek(FILE,0,0);
+        read(FILE,$temp,1);
+
+        close( FILE ) unless $temp eq 'S';
+	#print STDERR "File does not start with the correct magic value ($temp)\n" unless $temp eq 'S';
+        return 0 unless $temp eq 'S';
+
+        # read the first few bits, see if it matches signature
+        for( my $i=0 ; $i < 15; $i++ )
+        {
+                seek(FILE,$i,0);
+                read(FILE,$temp,1);
+                push( @words, $temp );
+        }
+
+
+        # create a string from the read characters
+        $line = join('',@words);
+
+        # close the file (for binary reading)
+        close( FILE );
+
+        # check if the line indicates a real sqlite database (version 3)
+        if( $line eq $magic )
+        {
+                # we know that this is a SQLite database, but is it a Firefox3 database?
+                $db = $$file;
+
+                # start by checking if we have a database journal as well
+                if ( -f $db . "-journal" )
+                {
+                        eval
+                        {
+                                # create a new variable to store the temp location
+                                $temp = rand();
+                                $temp = $tmploc . 'tmp_ff.' . $temp . 'v.db';
+
+                                # we need to copy the file to a temp location and start again
+                                copy( $db, $temp ) or die ( 'unable to copy database file' );
+                                copy( $db . "-journal", $temp . "-journal" ) or die( 'unable to copy journal file to temporary directory' );
+                                #print STDERR "[Firefox] Created a temp file $temp from $db\n";
+
+                                $db = $temp;
+                                $file_lock = 1; # indicate that we need to delete the lock file
+                        };
+                        if( $@ )
+                        {
+				print STDERR "Not able to copy file to a temporary location\n";
+				return 0;
+                        }
+                }
+
+                # set a temp variable to 0 (assume we don't have a FF3.5 database)
+                $temp = 0;
+
+                eval
+                {
+                        # connect to the database
+                        $vsth = $vdb = DBI->connect("dbi:SQLite:dbname=$db","","") or ( $temp = 1);
+
+                        if( $temp )
+                        {
+				#print STDERR "Not able to connect to database\n";
+				return 0;
+                        }
+
+                        # get a list of all available talbes
+                        $vsth = $vdb->prepare( "SELECT name FROM sqlite_master WHERE type='table'" ) or ($temp = 0);
+
+                        #execute the query
+                        $temp = 0;
+                        my $res = $vsth->execute();
+
+                        # check if we have a moz_places table
+                        while( @words = $vsth->fetchrow_array() )
+                        {
+                                # check for moz_places
+                                #print STDERR "RESULT IS " . $words[0] . "\n";
+                                $temp = 1 if $words[0] eq 'moz_places';
+                        }
+
+                        if( $temp )
+                        {
+                                # now we have a FF3+ history SQLite database
+				$ret = 1;
+				return 1;
+                        }
+                        else
+                        {
+				#print STDERR "Not the correct database table\n";
+				return 0;
+                        }
+
+                        # disconnect from the database
+                        $vsth->finish;
+                        undef $vsth;
+                        $vdb->disconnect;
+
+                        # delete the temporary database file (if it was locked)
+                        if( $file_lock )
+                        {
+                                #print STDERR "[Firefox] Deleting temporary files\n";
+                                unlink( $db ) or print STDERR "[Firefox] Unable to delete the temporary database file $db [$!] \n";
+
+                                if( -f $db . '-journal' )
+                                {
+                                        unlink( $db . '-journal' ) or print STDERR "[Firefox] Unable to delete the temporary database file " . $db . "-journal (journal) [$!]\n";
+                                }
+                                #else
+                                #{
+                                #       print STDERR "[Firefox] No journal file\n";
+                                #}
+
+                        }
+                };
+                if( $@ )
+                {
+			#print STDERR "Error while connecting and reading database\n";
+			return 0;
+                }
+        }
+        else
+        {
+		#print STDERR "Not the correct magic value\n";
+		return 0;
+        }
+
+	#print STDERR "Other error or lack of validation ($db)\n" unless $ret;
+
+	return $ret;
+}
+
+
+sub parse_dir($)
+{
+        my $d = shift;
+        my @ds;
+        my $done;
+	my @folder;
+
+        opendir( RD, $d ) || die( "Could not open the directory $d\n" );
+
+	# remove a separator in the end (if one is present)
+	$d =~ s/$sep$//;
+
+        # read all the file
+        @ds = map { $d . $sep . $_ } grep { !/^\.{1,2}$/ } readdir (RD);
+        closedir( RD );
+
+        # go through all files
+        for( @ds )
+        {
+		#print STDERR "NOW DOING $_\n";
+                # we don't want to process symbolic links, so test for that
+                next unless ( -f $_ or -d $_ );
+                next if -l $_;  # especially skip if we are hitting a symlink
+                $done = 0;
+	
+		# try to determine the userID and sessionID
+		@folder = split( /\\/ );
+		#@folder = split( /$sep/ );
+		$uID = $folder[$#folder-2];
+		$sID = $folder[$#folder-1];
+
+		#print STDERR "TESTING $_ (uid $uID, sid $sID)\n";
+
+		# now we need to check and parse each file
+		parse_file( $_ ) if verify( \$_ );
+
+		# now we need to check if this is a file or a folder
+		parse_dir( $_ ) if -d $_;
+
+	}
+}
+
 
 sub print_help
 {
