@@ -1,0 +1,1512 @@
+#!/opt/local/bin/perl
+#################################################################################################
+#		solcat
+#################################################################################################
+# solcat is a script that can read either a raw file (dd image, memory or disk image, or really
+# what ever raw image you pound at it) and carves out LSO (local shared object) files or Flash
+# cookies and parses them.
+#
+# The scipt is largely based on the input module sol.pm from the tool log2timeline (and other
+# parts of log2timeline, the library files Time.pm and BinRead.pm among others)
+#
+# The script was written as a part of a research paper on Flash cookies, written by Eric Huber and
+# co-authored by Kristinn Gudjonsson. Links to the paper will be released as soon as it is published
+# along with further information about the paper itself.
+#
+# The script either reads a .sol (LSO) file as an input or parses through a raw file and
+# carves out the LSO file from there.  The script then parses the flash cookie and extracts and
+# prints out all the information found in it, and calculates MD5 sum for the cookie file itself
+# and provides information about the data blocks where it detected the file.
+#
+# The tool works on a block size level, meaning it will read the first two bytes of every block
+# in the filesystem (default value of 4096 but can be configured using the -bs parameter) to
+# determine if there is a .sol file there.  If the first two bytes match, the tool will continue
+# and read the next 14 bytes to determine if this is a proper LSO header before attempting to 
+# carve and parse it.
+#
+# The problem with this approach is the fact that in a NTFS filesystem the LSO file is often
+# stored inside the MFT record itself, or the data part is resident within the MFT.  Therefore
+# the script also detects if we are dealing with a MFT (reads the first four bytes of every
+# block to determine a magic value for a MFT).  If it detects a MFT, it will read every byte
+# in the MFT to determine if it finds a LSO before moving on to the next block.
+#
+# Current limitation of the tool is that since it is a file carver (working on a raw file) it
+# does not extract the file name and path of the LSO, which could be essential information 
+# since the path indicates the web site that created the file, and without the path it is often
+# not possible to find out from where the LSO file came from.
+#
+# If there is enough demand, and enough free time for me, I might implement a MFT parser (to
+# begin with) that could parse through the MFT of an image file (NTFS) and search for all 
+# available LSO files in the disk image, parse them and display the correct file name and
+# path (it could be a choice, treat the image as a raw file or as a NTFS image file)
+# If the MFT would be parsed, that would entail that the tool would only detect files that
+# are either still allocated or files that have been deleted but still contain the information
+# in the MFT (not been reused).
+#
+# Another limitation is that this carver/script does not deal (at least not yet) with 
+# fragmented files.  The LSO file have to be sequential to be read correctly (unless the 
+# option of parsing a MFT file has been implemented, then it should be able to read those
+# files that are defined within the MFT correctly, despite being fragmented).
+#
+# Author: Kristinn Gudjonsson (kristinn ( a t ) log2timeline ( d o t ) net )
+# Version: 0.1
+# Date: 28/02/10
+#
+# Copyright 2009 Kristinn Gudjonsson, kristinn ( a t ) log2timeline ( d o t ) net
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#     Unless required by applicable law or agreed to in writing, software
+#     distributed under the License is distributed on an "AS IS" BASIS,
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#     See the License for the specific language governing permissions and
+#     limitations under the License.
+#
+# since the tool is so much based on log2timeline's code, I will include part of the original
+# comments in the code segment of sol.pm (before the start of the SolParse package definition)
+#
+
+use strict;
+use Getopt::Long; 	# read parameters
+use Pod::Usage;		# for help, man and documentation
+
+# for reading and parsing the XML schema
+# not currently used, but will be used later on when the XML data part
+# will be properly parsed
+#use XML::LibXML;
+#use XML::LibXML::Common;
+
+use Digest::MD5 qw(md5_hex); # to calculate MD5 sums
+
+use DateTime;		# for date calculations
+use DateTime::TimeZone;	# for timezone information
+
+# the version information
+use vars qw($VERSION);
+
+$VERSION = '0.1';
+
+# The following constants were taken from the file Cookie.pm
+# (a CPAN module, called Parse::Flash::Cookie)
+#  Copyright 2007 Andreas Faafeng, all rights reserved.
+# The below constants are little-endian.  Adobe flash cookies are
+# little-endian even on big-endian platforms.
+use constant POSITIVE_INFINITY => "\x7F\xF0\x00\x00\x00\x00\x00\x00";
+use constant NEGATIVE_INFINITY => "\xFF\xF0\x00\x00\x00\x00\x00\x00";
+use constant NOT_A_NUMBER      => "\x7F\xF8\x00\x00\x00\x00\x00\x00";
+
+
+# define some constants
+use constant {
+        LITTLE_E => 1,
+        BIG_E   => 0
+};
+
+
+# define needed variables
+my $file = undef;		# variable that stores the file name passed to the tool
+my $out_file = 'STDOUT';	# defines where to write the data to
+my $use_stdout = 1;		# defines whether or not we want to use STDOUT
+my $print_help = 0;
+my $debug = 0;
+my $ofs = 0; 	# initialize the offset (start from the beginning of the file)
+my $endian = BIG_E;	# defines that this file is saved using BIG ENDIAN style 
+my %header;	# a variable that stores information gathered from the LSO's header
+my %data;	# the data that is contained within the LSO file
+my $file_size;	# the size of the file that we are reading
+my $md5 = undef;	# the md5sum we are calculating
+my $tz = 'local';	# the timezone
+my $time_object = undef;
+my $show_version = 0;	# print version information
+my $file_data;
+my $blocksize = 4096;	# the blocksize we are using
+my $verification;	# variable to store the content from the verify function
+my $block = 0;		# the block number
+my $carve_sol = 0;	# should we carve the sol file?
+
+# read options
+GetOptions(
+	"read:s" => \$file,
+	"offset:s" =>\$ofs,
+	"debug!" => \$debug,
+	"write:s" => \$out_file,	# defines a directory to save files into
+	"zone:s" => \$tz,
+	"bs:s" => \$blocksize,
+	"version!" => \$show_version,
+	"savelso!" => \$carve_sol,
+        "help|?!"=>\$print_help
+) or pod2usage( 2 );
+
+# check if the file exists
+pod2usage( {
+	-message        => "Wrong usage: no file or invalid file passed as a parameter (use the -r FILE)\n",
+	-verbose        => 1,
+	-exitval        => 12 } ) unless -f $file;
+print STDERR "The file name passed to the script is '$file' and it exists\n" if $debug;
+
+# check if we are to print out help information
+pod2usage(2) if $print_help;
+
+# check if we want to see the version
+get_version() if $show_version;
+
+# check the file size
+$file_size = (stat( $file ) )[7];
+print STDERR "Files size is $file_size\n" if $debug;
+
+# check if we have a defined out_file
+if( $out_file eq 'STDOUT' )
+{
+	print STDERR "We are printing to STDOUT\n" if $debug;
+
+	# there is no directory defined and we are to print everything on STDOUT
+	$use_stdout = 1;
+	print "================================================================================\n";
+	print "\t\t\t- SOLCAT -\n";
+	print "================================================================================\n\n";
+	print 'Script run at: ' . epoch2text( time(), 1 ) . "\n";
+	print "Blocksize: $blocksize\n";
+}
+else
+{
+	# now we need to use a folder
+        # check if it exists
+	pod2usage( {
+		-message        => "Wrong usage: The directory passed in ($out_file) must not exist prior to execution, use another directory or delete it.\n",
+		-verbose        => 1,
+		-exitval        => 13 } ) if -e $out_file;
+
+	$use_stdout = 0;
+
+	print STDERR "We are printing to a file, create the directory '$out_file'\n" if $debug;
+
+	# now we need to create the directory
+	mkdir "$out_file" or pod2usage( {
+		-message        => "Unable to create the directory ($out_file). Error message: $@\n",
+		-verbose        => 1,
+		-exitval        => 14 } );
+
+	# and now to create an audit file
+	open( AF, '>' . $out_file . '/audit.txt' );
+
+	# print information into the file
+	print AF '================================================================================
+		SOLCAT audit file
+================================================================================
+Script run at: ' . epoch2text( time(), 1 ) . "\n";
+	print AF "Blocksize: $blocksize\n\n\n";
+	print AF "Filename\tBlock\tByte\tMD5 sum\n";
+	print "SOLCAT script is running, audit file has been created inside the directory $out_file\n";
+
+}
+
+# check the timezone settings
+eval
+{
+        print STDERR "[TimeZone] Testing time zone $tz\n" if $debug;
+        $time_object = DateTime::TimeZone->new( 'name' => "$tz" );
+};
+if( $@ )
+{
+        pod2usage( {
+                -message        => "Timezone [$tz] is not a valid timezone",
+                -verbose        => 1,
+                -exitval        => 11 } );
+}
+
+# check the timezone
+if( $tz eq 'local' )
+{
+        print "Timezone used: " . $time_object->name . ' (' . $time_object->short_name_for_datetime( DateTime->now() ) . ")\n\n" if $use_stdout;
+        print AF "Timezone used: " . $time_object->name . ' (' . $time_object->short_name_for_datetime( DateTime->now() ) . ")\n" unless $use_stdout;
+
+        $tz = $time_object->short_name_for_datetime( DateTime->now() );
+}
+
+# open the file
+open( FILE, $file );
+binmode( FILE );
+
+# fix the offset (default is zero)
+$ofs = $ofs * $blocksize;
+
+# now we enter a loop that continues until we've reached the end of the file we are parsing
+while( $ofs < $file_size )
+{
+	# initialize variables
+	%header = undef;	# contains header information from the LSO
+	%data = undef;		# contains parsed information about the LSO
+	$file_data = undef;	# contains the binary data for the LSO file itself
+
+	# include the starting offset into the header variable (before verify)
+	$header{'start_ofs'} = $ofs;
+
+	# verify the header (reads part of the file, increments the offset variable)
+	$verification = verify();
+
+	# now we are reading the file
+	if ( $verification eq 'SOL'  )
+	{
+		print STDERR "A LSO detected, block $block\n" if $debug;
+
+		# we got a sol file to parse (parse it and print out the information)
+		print_information() if parse_sol();
+	}
+	elsif( $verification eq 'MFT' )
+	{
+		# we are about to parse a MFT 
+		#
+		# to begin with we will examine every bit of the MFT, instead of 
+		# really parsing it, but later, this should be implemented in such
+		# a way that only the data part should be examined
+		while( $ofs <  ( $header{'start_ofs'} + $blocksize ) )
+		{
+			# now we are just incrementing the 
+			$verification = verify();
+			if( $verification eq 'SOL' )
+			{
+				print STDERR "WE HAVE REACHED A SOL (INSIDE A MFT)\n" if $debug;
+				print_information() if parse_sol();
+			}
+		}
+	}
+
+	# now we increment according to the blocksize (unless blocksize is 0, then we just increment)
+	$ofs = $header{'start_ofs'} + $blocksize unless $blocksize eq 0;
+
+	# increment the block count
+	$block++ unless $blocksize eq 0;
+}
+
+# now we've reached the end of the file in question, so we need to close the file
+close( FILE );
+
+# and close the audit file handle if we used that
+close( AF ) unless $use_stdout;
+
+# and exit gracefully
+exit 0;
+
+# a simple routine that will just print to the screen the current version number and
+# then exit the tool gracefully
+sub get_version()
+{
+	print $0, ' version ', $VERSION, "\n";
+	exit 0;
+}
+
+# the functions that follow are often either a direct copy or slightly modified functions from
+# the tool log2timeline (http://log2timeline.net), and since so many of these functions are taken
+# from the sol input module, I will let the original comments from that file follow:
+#
+# This parser parses Flash Shared Objects (Local Shared Object) files that Flash stores.  These
+# files are usually called Flash cookies, as they often contain the same content as regular cookies.
+#
+# Information about the structure of LSO can be found here:
+# 	http://sourceforge.net/docman/display_doc.php?docid=27026&group_id=131628
+#			(site available through Google Cache)
+#
+# Information from Adobe about how to create a tracking Flash banner can be found here:
+# 	http://www.adobe.com/resources/richmedia/tracking/designers_guide/
+#
+# And information from Adobe can be found here:
+# 	http://www.adobe.com/products/flashplayer/articles/lso/
+#
+# Information about version 10.1 of the Flash Player and how it will implement
+# privacy browsing, 
+# http://www.adobe.com/devnet/flashplayer/articles/privacy_mode_fp10.1.html
+#
+# Information about the format was partially extracted from the source code of the 
+# tool Solve (http://solve.sourceforge.net by Darron Schall) - no code has been used
+# from the project, just the layout and structure of the LSO files.
+# 
+# The files read are:
+#	datatypes/Types.java		- for the available data types
+#	fileformat/TCSOFileReader.java	- to analyse the structure of each data type 
+# 
+#
+# Copyright 2009,2010 Kristinn Gudjonsson (kristinn ( a t ) log2timeline (d o t) net)
+#
+#  This file is part of log2timeline.
+#
+#    log2timeline is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 3 of the License, or
+#    (at your option) any later version.
+#
+#    log2timeline is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with log2timeline.  If not, see <http://www.gnu.org/licenses/>.
+#
+# Few lines of code have been borrowed from a CPAN module called Parse::Flash::Cookie
+#  Copyright 2007 Andreas Faafeng, all rights reserved.
+
+
+
+# this is the prepare_file function of the log2timeline's input module, but modified
+# to fit this tool better
+#
+# The purpose of this subfunction is to prepare the log file or artifact for parsing
+# Usually this involves just opening the file (if plain text) or otherwise building a 
+# structure that can be used by other functions
+#
+# This function also accepts parameters for processing (for changing some settings in
+# the input module)
+#
+# @params A path to the artifact/log file/directory to prepare 
+# @params The rest of the ARGV array containing parameters to be passed to the input module
+# @return An integer is returned to indicate whether the file preparation was 
+#       successful or not.
+sub parse_sol()
+{
+	# default values
+	my $temp;
+	my $index;
+	my $orig_ofs = $ofs;
+
+	printf STDERR "[PARSE] Parsing a LSO file, offset 0x%x, block %d\n", $ofs,$block if $debug;
+
+	# read the length variable (determines how long the name part is)
+	$temp = read_16( \*FILE,\$ofs );
+
+	# construct a hash that contains all the needed information about the
+	# the LSO file
+	%data = (
+		'size' => $temp, 
+		'name' => read_ascii( \*FILE, \$ofs, $temp ),
+		'nothing' => read_32( \*FILE,\$ofs ),
+	);
+
+	print STDERR "[PARSE] The name is " . $data{'name'} . "\n" if $debug;
+	
+	# initialize the index variable
+	$index = 0;
+
+	# now we need to read in the variable part
+
+	# read in the variables
+	my $tag = 1;
+
+	# read until we have reached the end of the flash cookie
+	while( $tag )
+	{
+		# ofs might be somewhere in the file (where ever really, since this might be a raw disk image, or a memory capture)
+		$tag = 0 unless $ofs < ($orig_ofs + $header{'size'});
+		$tag = 0 if $ofs eq ( $orig_ofs + $header{'size'}) ;
+		next unless $tag;
+
+		printf STDERR "[PARSE] Reading the SOL (ofs: 0x%x)\n",$ofs if $debug;
+
+		# read the length variable as a temporary status
+		$temp = read_16( \*FILE, \$ofs );
+
+		# check to see if we have reached the end of file
+		$tag = 0 if $temp eq 0;
+		next unless $tag;
+
+		# start creating the variable
+		$data{'variable'}->{$index} = {
+			'name' => read_ascii( \*FILE, \$ofs, $temp ),
+			'length' => $temp,
+			'type' => read_8( \*FILE, \$ofs )
+		};
+
+		printf STDERR "[PARSE] Reading:\nType:\t%s\nName:\t%s\nLength:\t%s\n",$data{'variable'}->{$index}->{'type'}, $data{'variable'}->{$index}->{'name'},$data{'variable'}->{$index}->{'length'} if $debug;
+
+		# read the data type
+		$data{'variable'}->{$index}->{'data'} = lso_read_data_type(\$ofs,$data{'variable'}->{$index}->{'type'},$data{'variable'}->{$index}->{'name'});
+
+		return 0 unless defined $data{'variable'}->{$index}->{'data'};
+
+		# each data blocks ends (or begins with four bytes that are not used)
+		$ofs++;
+		$index++;
+	}
+
+	return 1;
+}
+
+# this was the old parse_line function, that is now, print information
+#       parse_line
+#
+# this function is now called print_information and is really quite modified
+# from the original version, since it is no longer constructing a hash that 
+# is returned to other modules in the framework... instead it formulates the 
+# gathered information and prints out the information either to a file or 
+# to STDOUT
+#
+sub print_information()
+{
+	my $text;	# the printed text
+
+	# since we are reading from a raw file (carving) we have no way
+	# to know the filesystem timestamps, wait with this stuff until
+	# we've implemented a MFT parser for this.
+	#
+	# get information about dates (std. filesystem timestamps)
+	#my ($atime,$mtime,$ctime) = (stat( $file ) )[8,9,10];
+
+	# construct the text variable
+
+	# construct the text variable
+	$text = '------------------------------------------------------------' . "\n";
+	$text .= 'Object name: ' . $data{'name'} . "\n"; 
+
+	# go through each variable found inside the flash cookie
+	foreach( keys %{ $data{'variable'} } )
+	{
+		# check if we have a date object (or any other kind)
+		# we need to construct the date object in a different manner ("resolve" the date, or write it in a human readable format)
+		if( $data{'variable'}->{$_}->{'type'} eq 11 )
+		{
+			# then we have a date
+			if( ( $data{'variable'}->{$_}->{'data'} eq 'inf' ) || ($data{'variable'}->{$_}->{'data'} eq 'nan' ) )
+			{
+				$text .=  "\t" . $data{'variable'}->{$_}->{'name'} . ' = ';
+				$text .= $data{'variable'}->{$_}->{'data'} eq 'inf' ? 'infinite' : 'not a number';
+			}
+			else
+			{
+				$text .= "\t" . $data{'variable'}->{$_}->{'name'} . ' = ' . epoch2text($data{'variable'}->{$_}->{'data'},1) . "\n" ;
+			}
+		}
+		else
+		{
+			# not a date, so just process it "normally"
+			# check if this is a hash or a value
+			if( ref( $data{'variable'}->{$_}->{'data'} ) eq 'HASH' )
+			{
+				# we have an object/array/xml or some other structure that returns a reference to a hash
+				$text .= "\t" . $data{'variable'}->{$_}->{'name'} . ' = { ' . "\n";
+				$text .= dump_value( $data{'variable'}->{$_}->{'data'}, $data{'variable'}->{$_}->{'type'}, "\t\t" );
+				$text .= "\n\t}\n";
+			}
+			else
+			{
+				# we have a simple variable
+				$text .= "\t" . $data{'variable'}->{$_}->{'name'} . ' = ' . dump_value( $data{'variable'}->{$_}->{'data'}, $data{'variable'}->{$_}->{'type'}, '' ) . "\n";
+			}
+		}
+	}
+
+	# calculate the MD5 sum
+	# we need to add one value to the file	
+	$file_data .= "\00";
+	$md5 = md5_hex( $file_data );
+
+	# check to see if we are to save the LSO file
+	if( $carve_sol )
+	{
+		# if we would like to save the actual sol file we could...
+		if( ! $use_stdout )
+		{
+			open( AA, '>' . $out_file . '/' . $block . '.sol'  );
+			print AA $file_data;
+			close(AA);
+		}
+	}
+
+	# now we need to check if we are to print to stdout or to a special file
+	if( $use_stdout )
+	{
+		# print to stdout
+		print  '------------------------------------------------------------
+File offset: ',"\t",  $header{'start_ofs'} . '
+MD5: ',"\t\t", $md5. "\n";
+		print $text . "\n\n";
+	}
+	else
+	{
+		# now we print to a directory and add to the audit
+		print AF $block, '.txt', "\t", $block, "\t", $header{'start_ofs'}, "\t", $md5, "\n";
+
+		open(OUT,'>' . $out_file . '/' . $block  . '.txt' );
+		print OUT $text;
+		close(OUT);
+		
+	}
+
+	return 1;
+}
+
+#	dump_value
+#
+# This function simply takes as an argument the data part of the variable found
+# inside the flash cookie and checks if it is a string or a reference to a hash.
+#
+# If it is a reference to a hash it then recursively goes through the hash to 
+# format it properly to print it out.
+#
+# Otherwise it just prints it out.
+#
+# @param value The data part (either a reference to a hash or a variable)
+# @return Return a string containing the content of the value parameter
+sub dump_value($$$)
+{
+	my $value = shift;
+	my $type = shift;
+	my $tab = shift;
+	my $t;
+
+	# check the data type
+	if( ref( $value ) eq 'HASH' )
+	{
+		foreach ( keys %$value )
+		{
+			$t .= $tab . $_ ;
+			if( scalar( $value->{$_} ) && ( ref( $value->{$_}->{'data'}) eq 'HASH' ) )
+			{
+				$t .= ' = ( ' . "\n";
+				$t .= dump_value( $value->{$_}->{'data'}, $value->{$_}->{'type'}, $tab . "\t"  );
+				$t .= $tab . ")\n";
+			}
+			else
+			{
+				$t .= ' => ';
+				$t .= epoch2text( $value->{$_}->{'data'}, 1 ) . "\n" if $value->{$_}->{'type'} eq 0xb ;
+				$t .= $value->{$_}->{'data'} . "\n" unless $value->{$_}->{'type'} eq 0xb;
+			}
+		}
+
+		return $t;
+	}
+	else
+	{
+		return $value unless $type eq 0xb;
+		return epoch2text( $value, 1 );
+	}
+}
+
+#       verify
+#
+# although this function has the same name as the one in the input module in log2timeline
+# it bears little resemblance with the original one.
+# this functon uses the current offset to determine if we've reached a LSO file (by examining
+# the header).  If some part of the header does not match, it will stop processing it further
+# and returns a zero value, indicating that we do not in fact have a LSO header file prsesent.
+# 
+# After each read, the offset is increased, so that reading through the file can be continued
+sub verify()
+{
+	my $t;
+	# read the header of the SOL
+
+	# try to determine if this is not a sol header, but a MFT one
+	$t = read_ascii( \*FILE, \$ofs, 4 );
+	$ofs -= 4;
+
+	if( $t eq 'FILE' )
+	{
+		$ofs += 4;
+		# we have a MFT on our hands
+		return 'MFT';
+	}
+
+	# 1. read the first part of the header (first magic)
+	$header{'header'} = read_16( \*FILE, \$ofs );
+
+	# check if this is the magic value
+	return 0 unless $header{'header'} eq 0xbf;
+	printf STDERR "[VERIFY] Reached the first magic part 0x%x (block %d)\n", $ofs-2,$block if $debug;
+
+	# 2. read the size
+	$header{'size'} = read_32( \*FILE, \$ofs );
+	$header{'size'} += 6; # to get the correct size
+
+	# 3. read the magic
+	$header{'magic'} = read_ascii( \*FILE, \$ofs, 4 );
+	return 0 unless $header{'magic'} eq 'TCSO';
+	print STDERR "[VERIFY] The magic is correct (second) and the size is: " . $header{'size'} . "\n" if $debug;
+
+	# 4. read the pad
+	$header{'pad_length'} = read_16( \*FILE, \$ofs );
+	return 0 unless $header{'pad_length'} eq 0x4;
+
+	$header{'pad'} = read_32( \*FILE, \$ofs ); 
+	return 0 unless $header{'pad'} eq 0x0;
+	print STDERR "[VERIFY] And the pad is correct as well\n" if $debug;
+
+	return 'SOL';
+}
+
+#	lso_read_double
+#
+# A function that takes as a parameter the offset to the flash cookie file (the
+# current location) as well as the name of the variable and reads a double 
+# number from the flash cookie.
+#
+# The function also checks if the double number can be converted to a date object
+# since some flash cookies store timestamps in a double number instead of using a 
+# proper date object.
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @param name The name of the variable (use it in the case the number is a time object)
+# @return Returns the date as milliseconds from Epoch, or the string 'inf' (infinitive)
+# or 'nan' (not a number)
+sub lso_read_double($$)
+{
+	my $o = shift;
+	my $name = shift;
+
+	my $num = undef;
+
+	# read the double
+	$num = read_double( \*FILE, $o );
+
+	print STDERR "[LSO] Reading a double number ($name) = $num\n" if $debug;
+
+	# check if the number is either infinite or not a number
+	if( $num ne 'inf' && $num ne 'nan' )
+	{
+		# check if this is really a date
+		my $check =  sol_date_calc($num, 0);
+
+		# if it looks like a date, then we fill it up
+		if( $check ne 'inf' && $check ne 'nan' && $check gt 0 )
+		{
+			print STDERR "[LSO] The double number is a date $check\n" if $debug;
+
+			# return the value in a human readable format
+			return epoch2text( $check, 1 ); 
+		}
+	}
+
+	return $num;
+}
+
+#	lso_read_boolean
+#
+# A function that takes as an input the current offset into the flash cookie and reads
+# a boolean value from it.
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @return A string containing the words 'FALSE' or 'TRUE', depending on the value found inside
+sub lso_read_boolean($)
+{
+	my $o = shift;
+	my $t;
+
+	$t = read_8(\*FILE,$o);
+	
+	printf STDERR "[LSO] BOOLEAN 0x%x\n", $t if $debug;
+
+	return 'FALSE' if $t eq 00;
+	return 'TRUE';
+}
+
+#	lso_read_string
+#
+# A function that takes as an input the current offset into the flash cookie and reads
+# a string value from it.
+# 
+# The function also reads the length variable, to know how far into the file the string lies.
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @return The string as it was read 
+sub lso_read_string($)
+{
+	my $o = shift;
+	my $t = read_16( \*FILE, $o );
+
+	return read_ascii( \*FILE,$o,$t);
+}
+
+#       lso_read_data_type
+#
+# A function that takes as an input the current offset into the flash cookie, the type 
+# of data object to read and the name of the variable and then calls the appropriate 
+# read functions based on the type of record.
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @param type An integer indicating which type of record to be read
+# @return Returns the data object that the appropriate read function returned, it should
+# either be a variable (string/int/..) or a reference to a hash 
+sub lso_read_data_type($$$)
+{
+	my $o = shift;
+	my $type = shift;
+	my $name = shift;
+
+	printf STDERR "[LSO] READING DATA TYPE 0x%x at offset: 0x%x\n",$type,$$o if $debug;
+
+	# 	--- the available types ---
+	#
+	#	0x00 - NUMBER
+	#	0x01 - BOOLEAN
+	#	0x02 - STRING
+	# 	0x03 - OBJECT
+	#	0x05 - NULL
+	#	0x06 - UNDEFINED
+	#	0x08 - ARRAY
+	#	0x0B - DATE
+	#	0x0F - XML
+	#	0x10 - CLASS
+	#
+	#
+	#	0x0D - NULL REALLY
+
+	# check the type of the variable (data part is of variable length, depending on the type)
+	# no switch sentence in Perl... so a long if..elsif..else sentence instead
+	if( $type eq 0x00 )
+	{
+		# here we get a number (double)
+		return lso_read_double( $o, $name );
+	}
+	elsif( $type eq 0x01 )
+	{
+		# the data part is either FALSE or TRUE	 (BOOLEAN)
+		return lso_read_boolean( $o );
+	}
+	elsif( $type eq 0x02 )
+	{
+		# we get a string value (so read the lenght in a temporary value)
+		return lso_read_string( $o );
+	}
+	elsif( $type eq 0x03 )
+	{
+		# this type is an OBJECT, read the object
+		return lso_read_object( $o );
+	}
+	elsif( $type eq 0x05 )
+	{
+		# nothing
+		return 'type 5 (none)';
+	}
+	elsif( $type eq 0x06 )
+	{
+		# nothing
+		return 'type 6 (undefined)';
+	}
+	elsif( $type eq 0x08 )
+	{
+		# array
+		return lso_read_array( $o );
+	}
+	elsif( $type eq 0x0D )
+	{	
+		# observed type in one instance
+		return 'NULL';
+	}
+	elsif( $type eq 11 )
+	{
+		# and we've got a DATE
+		return lso_read_date( $o );
+	}
+	elsif( $type eq 0x0F )
+	{
+		# a XML document
+		return lso_read_xml( $o );
+	}
+	elsif( $type eq 0x10 )
+	{
+		# CLASS
+		return lso_read_class( $o );
+	}
+	else
+	{
+		printf STDERR "[LSO] Unkown data type found (0x%x). Unable to process file [$file] further\n", $type;
+		return undef;
+	}
+
+	# return the content
+	return '';
+}
+
+#	lso_read_class
+#
+# A function that takes as an input the current offset into the flash cookie and reads
+# an class object from it.
+# 
+# The function (which is almost the same as lso_read_array) reads all the variables as 
+# well as their values from the LSO file and stores it as a HASH
+#
+# The object ends with a magic value of "00 00 09"
+#
+# The difference between an object and a class is that the class starts with a CLASS
+# name, which is then followed with other data types while the object does not contain
+# a name part
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @return A reference to a hash that stores all of the values inside the array
+sub lso_read_class($)
+{
+	my $o = shift;
+	my $t;
+	my $tag;
+	my %content;
+	my $name;
+	my $oname;
+
+	# read the name of the object
+	$oname = lso_read_string( $o );
+
+	# check if we've reached the "magic", meaning we've reached the end
+	$tag = lso_reached_magic($o);
+
+	# read the object until we've reached the end
+	while( $tag )
+	{
+		# check if we've reached the "magic", meaning we've reached the end
+		$tag = lso_reached_magic($o);
+		next unless $tag;
+
+		# read the objects name
+		$name = lso_read_string( $o );
+
+		# read the data type
+		$t = read_8( \*FILE, $o );
+		
+		$content{"$oname/$name"} = {
+			'data' => lso_read_data_type( $o, $t,$oname . '/' . $name ),
+			'type' => $t };
+
+		# check if we've read an undefined data type
+		return undef unless defined $content{"$oname/$name"};
+	}
+
+	# we don't want to be sending an object down 
+	return \%content;
+}
+
+# 	lso_read_xml
+#
+# This function reads the LSO file and reads an XML structure from it
+sub lso_read_xml( $ )
+{
+	my $t;
+	my $o = shift;
+	#my $string;
+	#my $xml_text;
+
+	printf STDERR "[LSO] Parse XML offset 0x%x\n",$$o if $debug;
+
+	# xml variables
+	#my ($xml,$xml_parsed,$prop);
+	#my (@prop_array);
+
+	$t = read_16( \*FILE, $o );	
+
+	if( $t ne 0x00 )
+	{
+		printf STDERR  "[LSO] Reading XML - value should be zero, 0x%x\n",$t if $debug;
+	}
+
+	# read the XML structure
+	$t = lso_read_string( $o ); 
+	$t =~ s/\n//g;
+	$t =~ s/\r//g;
+
+	return $t;
+
+	# this section is left blank until a proper XML decoder has been written, unil then
+	# we simply return the XML value without any parsing
+
+	#$xml_text = "<?xml version=\"1.0\" encoding=\"utf-8\" standalone=\"yes\" ?>\n" . $t . "</xml>"; 
+
+   	# get the XML
+        #$xml = XML::LibXML->new();
+
+	#print STDERR "[LSO] XML [$t]\n" if $debug;
+
+        #$xml_parsed = $xml->parse_string( $xml_text );
+
+        # now we need to parse the XML structure 
+        #$prop = $xml_parsed->getDocumentElement();
+        #@prop_array = $prop->childNodes;
+
+        # go through each of the child nodes
+        #foreach( @prop_array )
+        #{
+        #        if( $_->nodeType == ELEMENT_NODE )
+        #        {
+   	#		$string .= parse_xml( $_ );
+	#	}
+	#}
+	#
+	#return $string;
+}
+
+#	parse_xml
+# This function will be used later on when a proper XML code has been written to the 
+# tool, until then the XML will not be parsed, just printed out
+#sub parse_xml($)
+#{
+#	my $node = shift;
+#	my $string;
+#	my @attrs;
+#	my $temp;
+#	my @children;
+#
+#	$temp = '';
+#
+#	# we will go through each of the supplied value
+        # check if the node has attributes
+#        if( $node->hasAttributes() )
+#        {
+#        	@attrs = $node->attributes();
+#        	foreach my $attr (@attrs)
+#        	{
+#        		$temp .= $attr->nodeName . ' = ' . $attr->value . '- ';
+#        	}
+#        	# remove the last '- ' from the temp variable
+#        	$temp =~ s/- $//;
+#        }
+#
+#	if( $node->hasChildNodes() )
+#	{
+#		@children = $node->childNodes;
+#
+#		foreach( @children )
+#		{
+#			$string .= parse_xml( $_ );	
+#		}
+#	}
+#	else
+#	{
+#		$string = $temp eq '' ? $node->nodeName . ' = ' . $node->textContent : $node->nodeName . ' (' . $temp . ') = ' . $node->textContent;
+#        }
+#
+#        $string  =~ s/\r//g;
+#        $string  =~ s/\n//g;
+#	return $string;
+#	
+#}
+
+# lso_read_date
+#
+# This function takes as an input the current offset into the flash cookie file
+# and then reads a date object found inside it.
+#
+# Some of the methods here are derived from the Parse::Flash::Cookie
+# CPAN module.
+#
+# Copyright 2007 Andreas Faafeng, all rights reserved.
+#
+# @param o A reference to the integer that stores the current offset into the LSO file
+# @return Returns the date as a number (ms since Epoch) or a string (inf - infinite, 
+# nan - not a number) 
+sub lso_read_date($)
+{
+	my $o = shift;
+	my ($time, $utcofs, $time_ofs);
+
+	# read the time or the actual double number representing the date
+	$time = read_double( \*FILE, $o );
+
+	# read the current offset from UTC
+	#$utcofs = Log2t::BinRead::read_16(\*FILE, $o );
+	$utcofs = read_short(\*FILE, $o );
+	
+	# calculate the time offset	
+	$time_ofs = - $utcofs / 60;
+
+	print STDERR "[LSO - DATE] Time: $time - $time_ofs (" . sol_date_calc($time, $time_ofs) . ")\n" if $debug;
+
+	return sol_date_calc($time, $time_ofs);
+}
+
+#       lso_read_array
+#
+# A function that takes as an input the current offset into the flash cookie and reads
+# an array object from it.
+# 
+# The function (which is almost the same as lso_read_object) starts by reading the 
+# number of items to store inside the array (the only difference between an array and
+# an object) and then reads all the variables as well as their values from the LSO file
+# and stores it as a HASH
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @return A reference to a hash that stores all of the values inside the array
+sub lso_read_array($)
+{
+	my $o = shift;
+	my $t;
+	my $tag;
+	my %content;
+	my $name;
+
+	# read the number of items to process			
+	$t = read_32( \*FILE,$o );
+
+	print STDERR '[LSO] Array with ',$t, ' items.', "\n" if $debug;
+
+	# check if we've reached the "magic", meaning we've reached the end
+	$tag = lso_reached_magic($o);
+
+	# read the object until we've reached the end
+	while( $tag )
+	{
+		# check if we've reached the "magic", meaning we've reached the end
+		$tag = lso_reached_magic($o);
+		next unless $tag;
+
+		# read the variable's name 
+		$name = lso_read_string( $o );
+
+		print STDERR "[LSO] READING NAME [$name]\n" if $debug;
+		# read the data type
+		$t = read_8( \*FILE, $o );
+		
+		$content{"$name"} = {
+			'data' => lso_read_data_type( $o, $t, $name ),
+			'type' => $t };
+
+		# check if we've read an undefined data type
+		return undef unless defined $content{"$name"};
+	}
+
+	return \%content;
+}
+
+#	lso_reached_magic
+# 
+# A simple function that takes as an input the current offset into the LSO file
+# and reads three bytes to determine whether or not they contain the magic value
+# that represents the end of an array or an object data type.
+# 
+# @param o A reference to an integer that contains the current offset into the LSO file
+# @return Returns TRUE (1) if the magic value is not found and FALSE (0) if it is found
+sub lso_reached_magic($)
+{
+	my $o = shift;
+	my $t; # temp
+	my $a; # another temp
+
+	# check if we find the magic value
+        seek(FILE,$$o,0);
+        read(FILE,$t,1) or return 0;
+
+	# check the first value 
+	if( unpack( "s", $t ) == 0x0 )
+	{
+		$a = $t;
+
+		# check the next two bytes
+		seek( FILE, $$o+1, 0 );
+		read(FILE,$t,2) or return 0;
+	
+		# check the last two bytes
+		if( unpack( "n", $t ) == 0x0009 )
+		{
+			# add to the file data (for MD5 calculation)
+			$file_data .= $a;
+			$file_data .= $t;
+			$$o += 3;
+			return 0;
+		}
+	}
+
+	# did not find the magic value
+	return 1;
+}
+
+
+#       lso_read_object
+#
+# A function that takes as an input the current offset into the flash cookie and reads
+# an array object from it.
+# 
+# The function (which is almost the same as lso_read_array) reads all the variables as 
+# well as their values from the LSO file and stores it as a HASH
+#
+# The object ends with a magic value of "00 00 09"
+#
+# @param o A reference to an integer that stores the current offset into the LSO file
+# @return A reference to a hash that stores all of the values inside the array
+sub lso_read_object($)
+{
+	my $o = shift;
+	my $t;
+	my $tag;
+	my %content;
+	my $name;
+
+	# check if we've reached the "magic", meaning we've reached the end
+	$tag = lso_reached_magic($o);
+
+	# read the object until we've reached the end
+	while( $tag )
+	{
+		# check if we've reached the "magic", meaning we've reached the end
+		$tag = lso_reached_magic($o);
+		next unless $tag;
+
+		# read the objects name
+		$name = lso_read_string( $o );
+
+		# read the data type
+		$t = read_8( \*FILE, $o );
+		
+		$content{"$name"} = {
+			'data' => lso_read_data_type( $o, $t,$name ),
+			'type' => $t };
+
+		# check if we've read an undefined data type
+		return undef unless defined $content{"$name"};
+	}
+
+	# we don't want to be sending an object down 
+	return \%content;
+}
+
+# a method borrowed from Log2t::Time
+#
+
+# the function epoch2text takes as an input the Epoch time and converts it to a human readable format
+sub epoch2text($$)
+{
+        my $epoch = shift;
+        my $use_local= shift;
+
+        my $iso = DateTime->from_epoch( epoch => $epoch );
+
+        # set the timezone to the applied one
+        $iso->set_time_zone( $tz ) if $use_local;
+        $iso->set_time_zone( 'UTC' ) unless $use_local;
+
+        return sprintf "%s %s %0.2d %0.4d %0.2d:%0.2d:%0.2d (%s)", $iso->day_abbr,$iso->month_abbr,$iso->day,$iso->year,$iso->hour, $iso->minute, $iso->second,$tz if $use_local;
+        return sprintf "%s %s %0.2d %0.4d %0.2d:%0.2d:%0.2d GMT", $iso->day_abbr,$iso->month_abbr,$iso->day,$iso->year,$iso->hour, $iso->minute, $iso->second unless $use_local;
+}
+
+
+#
+#       sol_date_calc
+#
+# A function that calculates a date object (Epoch time) from an input provided by a Flash cookie
+# The date object may be either:
+#       Epoch time in ms
+#       Epoch time in s
+# The function really accepts any value of a double number and then determines if it is truly a date
+# object or just a number (compares it to likely date values)
+#
+sub sol_date_calc($$)
+{
+        my $ms = shift; # the double number as it is read from the Flash Cookie
+        my $ofs = shift; # the current offset in hours from UTC
+        my $sec;
+        my $date;
+
+        # check for "illegal" values, or non date values
+        if ( $ms lt 0 || $ms eq 'nan' )
+        {
+                return 'nan';
+        }
+
+        # check if we have a time in Epoch (that is not ms)
+        if( ($ms > 793800000) && ($ms < (time() + 631065600 ) ) )
+        {
+                $sec = $ms;
+        }
+        else
+        {
+                # we have ms, so we need to divid by 1.000
+                $sec = int( $ms / 1000 );
+        }
+
+        # check against a predefined date
+        # 793800000 - Sun Feb 26 12:00:00 1995 GMT
+        return 'nan' if( $sec < 793800000 );
+        # and now + 20 years ( 631065600 )
+        return 'inf' if( $sec ) > (time() + 631065600 );
+
+        # now we are pretty certain that we've got a date object, let's calculate the date
+        $date = DateTime->from_epoch( epoch => $sec );
+
+        #$date->subtract( hours => $ofs );
+
+        $sec = $date->epoch;
+
+        return 'inf' if $sec eq -1;
+
+        return $date->epoch;
+}
+
+####################
+# what now follows are methods from BinRead library (of log2timeline)
+####################
+
+#       read16
+#
+# A small function to read two bytes or 16 bits from the file and return it
+#
+# @params       FH      a file handle as a reference to a typeglob (\*FH)
+# @params       ofs     A reference to the offset variable 
+# @return two bytes of data
+sub read_16($$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+	my $temp;
+
+        seek($fh,$$ofs,0);
+        read($fh,$temp,2) or return 0;
+        $$ofs+=2;
+
+	# add to the file data (for MD5 calculation)
+	$file_data .= $temp;
+
+        if( $endian eq LITTLE_E )
+        {
+                return unpack("v", $temp );
+        }
+        else
+        {
+                return unpack("n", $temp );
+        }
+}
+
+sub read_short($$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+	my $temp;
+
+        seek($fh,$$ofs,0);
+        read($fh,$temp,2) or return 0;
+        $$ofs+=2;
+
+	# add to the file data (for MD5 calculation)
+	$file_data .= $temp;
+
+        if( $endian eq LITTLE_E )
+        {
+                return unpack("S", $temp );
+        }
+        else
+        {
+                return unpack("s", $temp );
+        }
+}
+
+#       read_double
+#
+# A small function to read eight bytes or 64 bits, a double precision number
+# and returns the number
+#
+# http://en.wikipedia.org/wiki/Double_precision
+#
+# @params       FH      a file handle as a reference to a typeglob (\*FH)
+# @params       ofs     A reference to the offset variable 
+# @return four bytes of data
+sub read_double($$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+	my $temp;
+
+        seek($fh,$$ofs,0);
+        read($fh,$temp,8);
+        $$ofs+=8;
+
+	# add to the file data (for MD5 calculation)
+	$file_data .= $temp;
+
+        # the following lines came from the CPAN module Parse::Flash::Cookie
+        # Copyright 2007 Andreas Faafeng, all rights reserved.
+        #
+        # Check special numbers - do not rely on OS/compiler to tell the
+        # truth.  
+        if ($temp eq POSITIVE_INFINITY)
+        {
+                return q{inf};
+        }
+        elsif ($temp eq NEGATIVE_INFINITY)
+        {
+                return q{-inf};
+        }
+        elsif ($temp eq NOT_A_NUMBER)
+        {
+                return q{nan};
+        }
+
+        $endian eq LITTLE_E ? return unpack 'd*', $temp : return unpack 'd*', reverse $temp;
+}
+
+#       read32
+#
+# A small function to read four bytes or 32 bits from the file and return it
+#
+# @params       FH      a file handle as a reference to a typeglob (\*FH)
+# @params       ofs     A reference to the offset variable 
+# @return four bytes of data
+sub read_32($$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+	my $temp;
+
+        seek($fh,$$ofs,0);
+        read($fh,$temp,4) or return 0;
+        $$ofs += 4;
+
+	# add to the file data (for MD5 calculation)
+	$file_data .= $temp;
+
+        if( $endian eq LITTLE_E )
+        {
+                return unpack("V", $temp );
+        }
+        else
+        {
+                return unpack("N", $temp );
+        }
+}
+
+#       read_8
+#
+# A small function to read one byte or eight bits from the file and return it
+# @return one byte of data
+sub read_8($$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+	my $temp;
+
+        seek($fh,$$ofs,0);
+        read($fh,$temp,1) or return 0;
+        $$ofs++;
+
+	# add to the file data (for MD5 calculation)
+	$file_data .= $temp;
+
+        #return $temp; 
+        return unpack( "c", $temp );
+}
+
+#       read_ascii
+#
+# A small function to read x bytes from the $fh packet, as defined in a parameter
+# to the function
+#
+# Example usage in script:
+# $string = Log2t::BinRead::read_ascii(\*FH, \$ofs, 4 );
+# 
+# @params       FH      a file handle as a reference to a typeglob (\*FH)
+# @params       ofs     A reference to the offset variable 
+# @params       for_length      An integer indicating the number of bytes to read
+# @return       A concentrated string that contains x bytes (for_length many bytes)
+sub read_ascii($$$)
+{
+        my $fh = shift;
+        my $ofs = shift;
+        my $for_length = shift;
+	my $temp;
+
+        my @l;
+
+        for( my $i=0 ; $i < $for_length; $i++ )
+        {
+                seek($fh,$$ofs,0);
+                read($fh,$temp,1) or return 0;
+
+		# add to the file data (for MD5 calculation)
+		$file_data .= $temp;
+
+                $$ofs++;
+                next if $temp eq "\0";
+                push( @l, $temp );
+        }
+
+        return 0 if $#l eq -1;
+
+        return join('',@l );
+}
+
+
+1;
+
+
+__END__
+
+=pod
+
+=head1 NAME
+
+B<solcat> - A script that parses Local Shared Objects (LSO) or Flash cookies as they are often referred to, and a LSO carver from raw images
+
+=head1 SYNOPSIS 
+
+B<solcat> [-o OFFSET] [-d] [-w DIR] [-z TIMEZONE] [-bs BLOCKSIZE] [-s] [-h] -r FILE
+ 
+=head1 OPTIONS
+
+=over 8
+
+=item B<-r|-read FILE>
+
+The file name can be either a .sol file, which will then be parsed and information about displayed or a raw file containing either an image file of a drive or a memory. If an image file is passed to the tool and it is not an image of a partition (instead a whole disk) it would be better to use the -o OFFSET to define an offset into the image file and perhaps to define the blocksize, if it is not the default size (4096 bytes).
+
+=item B<-o|-offset OFFSET>
+
+The OFFSET is defined as the offset to where the image begins, defined in the number of blocks from the beginning of the image file passed to the script.
+
+=item B<-d|-debug>
+
+Turn on more verbose output, where log information are passed to the STDERR.
+
+=item B<-w|-write DIR>
+
+By default the tool prints out all relevant information to the STDOUT.  But if this option is used a directory called DIR is created (cannot exist prior to execution) and all information that are parsed out of the image file will be saved into that directory along with a file called audit.txt that contains information about the image and all the extracted LSO files it found.
+
+=item B<-z|-zone TIMEZONE>
+
+The tool parses all date variables found within the LSO.  If no date is found the tool will print out all date variable according to the local timezone of the machine the tool was run from.  Otherwise it can be defined using this option.
+
+=item B<-bs BLOCKSIZE>
+
+The tool uses 4096 bytes as the default blocksize but this can be changed using this parameter.  The blocksize of 0 means that the tool will examine every byte in the file passed to it (very time consuming on a large image file).
+
+=item B<-v|-version>
+
+Show the current version of the tool.
+
+=item B<-s|-savelso>
+
+If the option of -w DIR has been used then the tool will also save the carved LSO file itself into the directory.
+
+=item B<-h|-help>
+
+Show a help message.
+
+=back
+
+=head1 DESCRIPTION
+
+B<solcat> is a script that can read either a raw file (dd image, memory or disk image, or really what ever raw image you pound at it) and carves out LSO (local shared object) files or Flash cookies and parses them.
+
+The scipt is largely based on the input module sol.pm from the tool log2timeline (and other parts of log2timeline, the library files Time.pm and BinRead.pm among others)
+
+The script was written as a part of a research paper on Flash cookies, written by Eric Huber  and co-authored by Kristinn Gudjonsson. Links to the paper will be released as soon as it is published along with further information about the paper itself.
+
+The script either reads a .sol (LSO) file as an input or parses through a raw file and carves out the LSO file from there.  The script then parses the flash cookie and extracts and prints out all the information found in it, and calculates MD5 sum for the cookie file itself and provides information about the data blocks where it detected the file.
+
+The tool works on a block size level, meaning it will read the first two bytes of every block in the filesystem (default value of 4096 but can be configured using the -bs parameter) to determine if there is a .sol file there.  If the first two bytes match, the tool will continue and read the next 14 bytes to determine if this is a proper LSO header before attempting to carve and parse it.
+
+The problem with this approach is the fact that in a NTFS filesystem the LSO file is often stored inside the MFT record itself, or the data part is resident within the MFT.  Therefore the script also detects if we are dealing with a MFT (reads the first four bytes of every block to determine a magic value for a MFT).  If it detects a MFT, it will read every byte in the MFT to determine if it finds a LSO before moving on to the next block.
+
+=head1 BUGS AND LIMITATION
+
+Current limitation of the tool is that since it is a file carver (working on a raw file) it does not extract the file name and path of the LSO, which could be essential information since the path indicates the web site that created the file, and without the path it is often not possible to find out from where the LSO file came from.
+
+If there is enough demand, and enough free time for me, I might implement a MFT parser (to begin with) that could parse through the MFT of an image file (NTFS) and search for all available LSO files in the disk image, parse them and display the correct file name and path (it could be a choice, treat the image as a raw file or as a NTFS image file) If the MFT would be parsed, that would entail that the tool would only detect files that are either still allocated or files that have been deleted but still contain the information in the MFT (not been reused).
+
+Another limitation is that this carver/script does not deal (at least not yet) with fragmented files.  The LSO file have to be sequential to be read correctly (unless the option of parsing a MFT file has been implemented, then it should be able to read those files that are defined within the MFT correctly, despite being fragmented).
+
+=head1 AUTHOR
+
+Kristinn Gudjonsson <kristinn (a t) log2timeline ( d o t ) net>
+
+=head1 COPYRIGHT
+
+The tool is released under GPL so anyone can contribute to the tool. Copyright 2010.
+
+=cut
+

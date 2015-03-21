@@ -40,7 +40,7 @@
 # Version : 0.2
 # Date : 23/09/09
 #
-# Copyright 2009 Kristinn Gudjonsson, security ( a t ) kiddaland ( d o t ) net
+# Copyright 2009 Kristinn Gudjonsson, kristinn ( a t ) log2timeline ( d o t ) net
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.

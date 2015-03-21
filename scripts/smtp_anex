@@ -1,0 +1,1264 @@
+#!/usr/bin/perl
+#################################################################################################
+#			STMP_ANEX (SMTP ANalyze and EXtract)
+#################################################################################################
+# This script reads a text file that contains a SMTP conversation and dumps relevant information
+# from it, such as the header information, the message content, and it extracts attachments 
+# as well
+#
+# This script was originally written to answer the questions in the following network forensics
+# contest:
+#	http://forensicscontest.com/2009/10/10/puzzle-2-ann-skips-bail
+#
+# For further information about the SMTP code, see the RFC's:
+#	+ http://www.rfc-editor.org/rfc/rfc2821.txt
+#	+ http://www.rfc-editor.org/rfc/rfc1123.txt
+#	+ http://www.rfc-editor.org/rfc/rfc1893.txt
+#	+ http://www.rfc-editor.org/rfc/rfc2034.txt
+#
+# Author: Kristinn Gudjonsson
+# Version : 0.2
+# Date : 16/10/09
+#
+# Copyright 2009 Kristinn Gudjonsson, kristinn ( a t ) log2timeline ( d o t ) net
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+#     Unless required by applicable law or agreed to in writing, software
+#     distributed under the License is distributed on an "AS IS" BASIS,
+#     WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#     See the License for the specific language governing permissions and
+#     limitations under the License.
+#
+use strict;
+use MIME::Base64;
+use Getopt::Long; # read parameters
+use Pod::Usage;
+use Digest::MD5;	# to calculate md5 sums
+use Time::localtime;	# to find the current date
+use Encode;
+
+use vars qw($VERSION);
+# version information
+$VERSION = '0.2';
+
+# define constants
+use constant {
+	CASE_SENSITIVE	=> 0,
+	NO_FORMAT	=> 1,
+	NO_NEWLINE	=> 2,
+};
+
+# define needed variables
+my $smtp_file;
+my $out_file;
+my $show_version;
+my $print_help;
+my $debug;
+my $quiet;
+my $cur_time;
+
+my %reply_codes;	# a hash that contains the SMTP reply codes
+my %smtp_cmd;		# a hash that contains commands
+my %info;		# a hash that contains information about the message
+my $msg;
+my $msg_nr;
+my $temp;
+my $word;
+my ($t,$l);
+my $dir;
+my @boundary;
+
+
+# default values
+$show_version = 0;
+$print_help = 0;
+$smtp_file = undef;
+$dir = '.';
+$msg_nr = 1;
+$debug = 0;
+$quiet = 0;
+$cur_time = time();
+
+# fill in the SMTP protocol specifics (according to RFC 2821)
+%reply_codes = (
+	'200' =>	'(nonstandard success response, see rfc876)',
+	'211' =>	'System status, or system help reply',
+	'214' =>	'Help message',
+	'220' =>	'<domain> Service ready',
+	'221' =>	'<domain> Service closing transmission channel',
+	'250' =>	'Requested mail action okay, completed',
+	'251' =>	'User not local; will forward to <forward-path>',
+	'354' =>	'Start mail input; end with <CRLF>.<CRLF>',
+	'421' =>	'<domain> Service not available, closing transmission channel',
+	'450' =>	'Requested mail action not taken: mailbox unavailable',
+	'451' =>	'Requested action aborted: local error in processing',
+	'452' =>	'Requested action not taken: insufficient system storage',
+	'500' =>	'Syntax error, command unrecognised',
+	'501' =>	'Syntax error in parameters or arguments',
+	'502' =>	'Command not implemented',
+	'503' =>	'Bad sequence of commands',
+	'504' =>	'Command parameter not implemented',
+	'521' =>	'<domain> does not accept mail (see rfc1846)',
+	'530' =>	'Access denied (Sendmailism)',
+	'535' =>	'Authentication failed',
+	'550' =>	'Requested action not taken: mailbox unavailable',
+	'551' =>	'User not local; please try <forward-path>',
+	'552' =>	'Requested mail action aborted: exceeded storage allocation',
+	'553' =>	'Requested action not taken: mailbox name not allowed',
+	'554' =>	'Transaction failed'
+);
+
+# the available SMTP commands and their respective allowed responses (not complete)
+# not complete and not used completly. The idea of this hash is to verify the SMTP conversation
+# that is to match commands with the corresponding response code
+%smtp_cmd = (
+	'connect'	=> { 220, 421 },
+	'helo'		=> { 250, 500, 501, 504, 521, 421 },
+	'auth'		=> { 250, 334, 535 },
+	'ehlo'		=> { 250, 550, 500, 501, 504, 421 },
+	'mail'		=> { 250, 552, 451, 452, 500, 501, 421 }, 
+	'rcpt'		=> { 250, 251, 550, 551, 552, 553, 450, 451, 452, 500, 501, 503, 521, 421 },
+	'data'		=> { 354, 451, 554, 500, 501, 503, 421 },
+	'received data' => { 250, 552, 554, 451, 452 },
+	'rset'		=> { 200, 250, 500, 501, 504, 421 },
+	'send'		=> { 250, 552, 451, 452, 500, 501, 502, 421 },
+	'soml'		=> { 250, 552, 451, 452, 500, 501, 502, 421 },
+	'saml'		=> { 250, 552, 451, 452, 500, 501, 502, 421 },
+	'vrfy'		=> { 250, 251, 550, 551, 553, 500, 501, 502, 504, 421 },
+	'expn'		=> { 250, 550, 500, 501, 502, 504, 421 },
+	'help'		=> { 211, 214, 500, 501, 502, 504, 421 },
+	'noop'		=> { 200, 250, 500, 421 },
+	'quit'		=> { 221, 500 },
+	'turn'		=> { 250, 502, 500, 503 }
+);
+
+
+# read options
+GetOptions(
+        "read:s"=>\$smtp_file,
+	"directory:s"=>\$dir,
+	"quiet!"=>\$quiet,
+        "version!"=>\$show_version,
+	"analyse!"=>\$debug,
+        "help|?!"=>\$print_help
+) or pod2usage( 2 );
+
+# check if we are asking for help
+pod2usage(1) if $print_help;
+
+# print versioning information
+show_version() if $show_version;
+
+# there is no point in running this tool if the there is no file to read
+pod2usage( {
+	-message        => "The option -r to define a text file containing the SMTP conversation has to be defined.",
+	-verbose        => 1,
+	-exitval        => 12 } ) unless defined $smtp_file;
+
+# we need this file to exist
+pod2usage( {
+	-message        => "The text file containing the SMTP conversation has to exist (the file defined with the -r option)",
+	-verbose        => 1,
+	-exitval        => 13 } )  unless -e $smtp_file;
+
+
+# open the file up
+open(FH,$smtp_file) or pod2usage( {
+	-message	=> 'Unable to open the file ' . $smtp_file . '.  Do you have enough permission to open it?',
+	-verbose	=> 1,
+	-exitval	=> 14 } );
+
+# check if the output directory exists
+pod2usage( {
+	-message	=> 'The directory ' . $dir . ' already exists. Please use another directory before continuing',
+	-verbose	=> 1,
+	-exitval	=> 15 } ) if ( $dir ne '.' && -d $dir ); 
+
+# try to create the directory
+mkdir $dir, 0750 or pod2usage( {
+	-message	=> 'Unable to create directory ' . $dir . '. Do you have enough permission to create the directory?',
+	-verboes	=> 1,
+	-exitval	=> 16 } ) unless -d $dir;
+
+
+# open up a raw message content
+open( RAW, '>' . $dir . '/' . $msg_nr . '-RAW.txt' );
+
+# read through each and every line of the file
+while( $_ = read_line()  )
+{
+	# start analyzing the file
+
+	#	--- HEADER ---
+
+	# test if this is the banner
+	if( /^220 (.*)$/ )
+	{
+		$info{'banner'} = $_;
+		next;
+	}
+	
+	# check if this is a command
+	$t = 1;
+
+	# read all commands
+	while( $t )
+	{
+		print STDERR "\n-----\nTESTING LINE [$_]\n" if $debug;
+
+		# if we have reached the data part
+		if( $_ eq 'data' )
+		{
+			dump_datapart( read_line() );
+			print STDERR "Returning from DATA part \n" if $debug;
+
+			# now we know that since the datapart is over we have reached the end of that message
+			print_info();
+			$msg_nr++;	# increase the message number
+			# close the raw file
+			close( RAW );
+
+			# open a new raw file
+			open( RAW, '>' . $dir . '/' . $msg_nr . '-RAW.txt' );
+
+			print STDERR "\n-----\nTESTING LINE [$_]\n" if $debug;
+		}
+
+		# test if we are about to quit
+		if( lc($_) eq 'quit' )
+		{
+			print STDERR "[READING] Command 'quit' ISSUED\n" if $debug;
+
+			$info{'trailing'} = read_line() or $t=0;
+
+			if( $info{'trailing'} =~ m/^221/ )
+			{
+				$t = 0;
+			
+				# close the raw file
+				close( RAW );
+				next;
+			}
+
+			# test if $t is no longer valid
+			next unless $t;
+
+		}
+		
+		# split the command in two parts, that is the command and it's options
+		if( /^([a-z]*) (.*)/ )	
+		{
+			print STDERR  "[READING] COMMAND $1\n"  if $debug;
+
+			$t = 0 unless exists( $smtp_cmd{$1});
+
+			next unless $t;
+	
+			# now we need to parse the command
+			$_ = dump_cmd($1, $2 ) if exists ($smtp_cmd{$1});
+		}
+		else
+		{
+			print STDERR "[READING] AND THE COMMAND IS (entire line) $_\n" if $debug;
+			$t = 0 unless exists( $smtp_cmd{lc($_)});
+
+			next unless $t;
+
+			# now we need to parse the command
+			$_ = dump_cmd($_, '' ) if exists ($smtp_cmd{lc($_)});
+		}
+	}
+}
+
+# close the conversation file (done with it)
+close( FH );
+
+# we need to remove the last raw file (we always create a file beforehand)
+unlink( $dir . '/' . $msg_nr . '-RAW.txt' );
+
+exit 0;
+
+#################################################################################
+# 	functions
+#################################################################################
+
+#	print_info
+# This function is called when a message has been completly read.
+# It's purpose is very simple, to print out information gathered from 
+# the SMTP conversation
+#
+# It prints the information to a file called NR-info.txt where NR is
+# the message number in the conversation (starts by 1)
+#
+# The function accepts no parameters and does not return anything
+# (uses global variables)
+sub print_info()
+{
+	my $printout;
+
+	# start by opening up a file
+	open( IF, '>' . $dir . '/' . $msg_nr . '-info.txt' );
+
+	# print out information about the SMTP conversation
+	$printout =  "------------------------------------------------------------
+	SMTP_ANEX (SMTP ANALYSIS AND EXTRACTION)
+------------------------------------------------------------\n\n";
+	$printout .= "Tool run on: " . ctime( $cur_time  ) . "\n\n";
+	
+	# print basic information
+	$printout .= "Information from e-mail header\n";
+	$info{'mail_from'} =~ s/SIZE=\d+//ig;
+	$info{'mail_from'} =~ s/[<|>]//g;
+
+	# check if we are reading a BATV mail_from ( pvrs=RANDOM=EMAIL )
+	if( $info{'mail_from'} =~ m/prvs=(.+)=(.+)/ )
+	{
+		$info{'mail_from'} = $2 . "\t" . '(BATV used for SPAM fighting - string ' . $1 . ')';
+	}
+
+	$info{'rcpt_to'} =~ s/[<|>]//g;
+
+	# check if we are reading a BATV rcpt to ( pvrs=RANDOM=EMAIL )
+	if( $info{'rcpt_to'} =~ m/prvs=(.+)=(.+)/ )
+	{
+		$info{'rcpt_to'} = $2 . "\t" . '(BATV used for SPAM fighting - string ' . $1 . ')';
+	}
+	
+	$printout .= "\tMail from: " . $info{'mail_from'} . "\n";
+	$printout .= "\tRecipient: " . $info{'rcpt_to'} . "\n";
+	
+	delete $info{'mail_from'};
+	delete $info{'rcpt_to'};
+	
+	$printout .= "\nInformation from e-mail body\n";
+	
+	$printout .=  "\tMail from: " . $info{'header'}->{'from'} . "\n" if exists( $info{'header'}->{'from'} );
+	$printout .= "\tMail to  : " . $info{'header'}->{'to'} . "\n" if exists( $info{'header'}->{'to'} );
+	$printout .= "\tMail to (cc)  : " . $info{'header'}->{'cc'} . "\n" if exists( $info{'header'}->{'cc'} );
+	$printout .= "\tSubject  : " . $info{'header'}->{'subject'} . "\n" if exists( $info{'header'}->{'subject'} );
+	
+	delete $info{'header'}->{'from'};
+	delete $info{'header'}->{'to'};
+	delete $info{'header'}->{'cc'};
+	delete $info{'header'}->{'subject'};
+	
+	$printout .= "\nAuthentication information:\n\tUsername: " . $info{'Username'} . "\n\tPassword: " . $info{'Password'} . "\t" . $info{'auth_success'} . "\n" if exists( $info{'Username'} );
+
+	delete $info{'Username'};
+	delete $info{'Password'};
+	delete $info{'auth_success'};
+
+
+	# check to see if there is a header
+	if( exists( $info{'header'} ) )
+	{
+		$printout .= "\nHeader information:\n";
+	
+		my $ref = $info{'header'};
+	
+		while ( my ($key, $value) = each(%$ref) ) 
+		{
+			$printout .= "\t$key : " .$value . "\n";
+		}
+	}
+
+	$printout .= "\n\nAdditional information: \n ";
+	
+	foreach( keys( %info ) )
+	{
+		$printout .= "\t" . $_ . ": " . $info{$_} . "\n";
+	}
+
+
+	$printout .= "------------------------------------------------------------
+		The message content
+------------------------------------------------------------\n\n";
+	$printout .= $msg;
+
+
+	# clean initialize variables
+	%info = undef;
+	$msg = undef;
+
+	# print out to file and close it
+	print IF $printout;
+	close( IF );
+
+	# and print out the information
+	print $printout unless $quiet;
+}
+
+
+# 	dump_datapart
+#
+# This function dumps the data part of the message, that is the part that comes 
+# after the command DATA has been issued and until a line containing only a dot (.)
+# appears (defining the end of the data part)
+#
+# @param	Accepts the current line from the smtp file (should be the response
+#		from the server for the data part)
+sub dump_datapart
+{
+	# define needed temporary variables
+	my $a, $b;
+	my $encoding = 'utf-8';
+	my $ref;
+	my $transfer;
+	my $old = undef;
+	my $temp;
+
+	# null the boundary array
+	@boundary = undef;
+
+	# read the first line (the response code to DATA command)
+	$_ = shift;
+
+	print STDERR "[DATA] DUMPING DATAPART $_\n" if $debug;
+
+	$info{'data_cmd_response'} = $_;
+
+	# read the next line
+	$_ = read_line(CASE_SENSITIVE);
+
+	# 	- HEADER -
+	# start by reading header information
+	while( $_ !~ /^$/ )
+	{
+		# test if this is a continuation of the old header
+		if( $_ !~ /^[a-zA-Z]/ )
+		{
+			# not starting with a normal character, so assume we are still in the old header
+			$a = $_;
+			decode_text( \$a );
+
+			if( $old =~ /[to|from|cc]/ )
+			{
+				$info{'header'}->{lc($old)} .= "\n\t\t" . $a;
+			}
+			else
+			{
+				$info{'header'}->{lc($old)} .= ' ' . $a;
+			}
+		}
+		else
+		{
+			# read a header and it's value
+			($a,$b) = split( /:/ );
+			decode_text( \$b );	# decode if needed
+			$info{'header'}->{lc($a)} = $b;
+		
+			$old = $a;
+		}
+	
+		# check if we have reached a boundary
+		if( $a =~ m/boundary=(.+)/i )
+		{
+			$temp = $1;
+			$temp =~ s/"//g;
+			push( @boundary,$temp );
+			print STDERR "[DATA] New boundary: [$temp]\n" if $debug;
+	
+		}
+		# the boundary can also be in the value part
+		elsif( $b =~ m/boundary=(.+)/i )
+		{
+			$temp = $1;
+			$temp =~ s/"//g;
+
+			push( @boundary,$temp );
+			print STDERR "[DATA] New boundary: [$temp]\n" if $debug;
+	
+		}
+       	        elsif( $b =~ m/charset=(.+)/i )
+       	        {
+			$encoding = $1;
+       	       	        $encoding =~ s/"//g;
+       	       	        $encoding =~ s/;//g;
+	
+               	        print STDERR "[DATA] CHARSET: $encoding\n" if $debug;
+               	}
+		elsif( $a =~ m/transfer-encoding/i )
+		{
+			$transfer = $b;
+			$transfer =~ s/\s//g;
+
+			print STDERR "[DATA] Transfer: $transfer\n" if $debug;
+		}
+
+		# read the next line
+		$_ = read_line(CASE_SENSITIVE);
+
+		print STDERR "[DATA] READING HEADER " . lc($a) . " = $b\n" if $debug;						
+	}
+
+
+	# test if we have a Lotus Mail client (sometimes they skip mentioning the boundary)
+	if( $info{'header'}->{'x-mailer'} =~ m/lotus notes/i )
+	{
+		print STDERR "[DATA] We have a Lotus Notes client\n" if $debug;
+
+		# add a boundary
+		if( exists( $info{'header'}->{'message-id'} ) )
+		{
+
+			print STDERR "[DATA] Message ID exists\n" if $debug;
+
+			$b = $info{'header'}->{'message-id'};
+			if( $b =~ m/.+\s([0-9|A-F|a-f]+)_="$/ )
+			{
+				push( @boundary, '=_alternative ' . $1 . '_=' );
+				print STDERR "[DATA] Found new boundary: =_alternative $1" . "_=\n" if $debug;
+			}
+			
+		}
+	}
+		
+	# our line is empty, so read the next line
+	$_ = read_line(NO_NEWLINE);
+	
+	print STDERR "[DATA] NEXT LINE IS $_\n" if $debug;
+
+	# test if this is only a text message
+	if( $info{'header'}->{'content-type'} =~ m/text\/plain/i ) 
+	{	
+		# now we know that the message only contains text
+		print STDERR "[DATA] DUMPING TEXT\n" if $debug;
+
+		my $t;
+		while( $_ !~ /^.$/ )
+		{
+			print STDERR "[DATA] Examining line: $_\n" if $debug;
+			$t .= $_ . "\n";
+
+			# read the next line
+			$_ = read_line(NO_NEWLINE);
+			
+		}
+		clean_text( \$t );
+		$msg = encode( 'utf-8', decode( $encoding, $t) );
+
+		# print the message
+		open( TF, '>' . $dir . '/' . $msg_nr . '-Text.txt');
+		print TF $msg;
+		close(TF);
+		
+	}
+	elsif( $info{'header'}->{'content-type'} =~ m/text\/html/i ) 
+	{
+		print STDERR "[DATA] Only HTML dumping\n" if $debug;
+
+		my $t;
+		while( $_ !~ /^.$/ )
+		{
+			print STDERR "[DATA] Examining line: $_\n" if $debug;
+			$t .= $_ . "\n";
+
+			# read the next line
+			$_ = read_line(NO_NEWLINE);
+			
+		}
+
+		# check if transfer is base64
+		if( $transfer =~ m/base64/i )
+		{
+			$t = decode_base64( $t );
+		}
+
+		clean_text( \$t );
+		$msg = encode( 'utf-8', decode( $encoding, $t) );
+
+		# print the message
+		open( TF, '>' . $dir . '/' . $msg_nr . '-HTML.html');
+		print TF $msg;
+		close(TF);
+		
+	}
+	#elsif( $info{'header'}->{'content-type'} =~ m/multipart/i ) 
+	else
+	{
+		# 	- CONTENT -
+		# read through all the datapart (ends with a .)
+		while( $_ ne '.' )
+		{
+			print STDERR "[DATA] EXAMINING LINE $_\n" if $debug;
+      last unless $_;
+
+			if( /boundary="(.+)"/i )
+			{
+				push(@boundary, $1);
+				print STDERR "[DATA] New boundary: [$1]\n" if $debug;
+			}
+	
+			# check if we have reached a content-type
+			if( /content-type:/ )
+			{
+				# we have a content type to dump, check out which kind
+
+				# an application => attachment
+				if( /application\// )
+				{
+					print STDERR "[DATA] DUMPING ATTACHMENT\n" if $debug;
+					$_ = dump_attachment($_);
+				}
+				# this is an image attachment
+				elsif( /image\// )
+				{
+					print STDERR "[DATA] Dumping IMAGE\n" if $debug;
+					$_ = dump_attachment($_);
+				}
+				# here we have a text
+				elsif( /text\/plain/ )
+				{
+					print STDERR "[DATA] DUMPING PLAIN TEXT\n" if $debug;
+					# plain text
+					dump_text($_,'Text');
+				}
+				# and a html part
+				elsif( /text\/html/ )
+				{
+					print STDERR "[DATA] DUMPING HTML\n" if $debug;
+					# a HTML message
+					dump_text($_,'HTML');
+				}
+			}
+
+			# if the next line is a dot, then we want to exit the loop before reading a new line
+			next if $_ eq '.';
+		
+			# read the next line
+			$_ = read_line();
+		}
+
+		print STDERR "[DATA] Reached the end of a while loop, line is [$_]\n" if $debug;
+	}
+	print STDERR "[DATA] Going away from DATA area\n" if $debug;
+	
+	# the next line in question
+	$info{'data_response'} = read_line(CASE_SENSITIVE);
+	$_ = $info{'data_response'};
+
+	print STDERR "[DATA] Response from DATA area is " . $info{'data_response'} . "\n" if $debug;
+
+	# read the line
+	if( $info{'data_response'} =~ /^\d{3}/ )
+	{
+		# the data response is a response, so read the next line in question
+		$_ = read_line();
+	}
+
+	print STDERR "[DATA] Returning with the current line loaded being: [$_]\n" if $debug;
+	return 1;
+}
+
+#	dump_text
+# This functions starts inside a text part of the e-mail itself
+# and reads the text and stores it in a variable
+sub dump_text($$)
+{
+	my $line = shift;
+	my $type = shift;
+	my $charset = 'utf-8';
+	my $a;
+	my $text;
+	my $tag;
+	my $transfer;
+	my $temp;
+
+	# create a file
+	if( $type eq 'Text' )
+	{
+		open( TF, '>' . $dir . '/' . $msg_nr . '-' . $type . '.txt' );
+	}
+	elsif( $type eq 'HTML' )
+	{
+		open( TF, '>' . $dir . '/' . $msg_nr . '-' . $type . '.html' );
+	}
+	else
+	{
+		open( TF, '>' . $dir . '/' . $msg_nr . '-' . $type . '.' . $type );
+	}
+
+	# read a line (don't want it to be changed into lowercase)
+	#$line = read_line(CASE_SENSITIVE);
+
+	$msg .= "\n-------- $type --------\n";
+
+	# read until a space appears
+	while( $line ne '' )
+	{
+		print STDERR "[TXTDUMP] LINE $line\n" if $debug;
+
+		# the only thing we are interested in is the charset
+		if( $line =~ m/charset/ )
+		{
+			($a,$charset) = split( /=/, $line );
+			$charset =~ s/"//g;
+			$charset =~ s/;//g;
+
+			print STDERR "CHARSET: $charset\n" if $debug;
+		}
+
+		if( $line =~ m/transfer-encoding/i )
+		{
+			($a,$transfer) = split( /:/, $line );
+			$transfer =~ s/"//g;
+
+			print STDERR "[TXTDUMP] TRANSFER ENCODING: $transfer\n" if $debug;
+		}
+
+		$line = read_line(CASE_SENSITIVE);
+	}
+
+	# now we must read until we hit the "----" sign, indicating the next part
+	$tag = 1;
+	while( $tag )
+	{
+		$line =~ s/\n//g;
+		$line =~ s/\r//g;
+
+		#$tag = 0 if $line =~ m/^------/;
+		foreach my $bound (@boundary)
+		{
+			next if $bound eq '';
+
+			# modify both bond and line to ease regular expressions
+			$temp = $bound;
+			$temp =~ s/\+/__plus__/g;
+			$temp =~ s/\//__slash__/g;
+			$temp =~ s/\(/__open__/g;
+			$temp =~ s/\)/__close__/g;
+			$temp = lc( $temp );
+			
+			$a = $line;
+			$a =~ s/\+/__plus__/g;
+			$a =~ s/\//__slash__/g;
+			$a =~ s/\(/__open__/g;
+			$a =~ s/\)/__close__/g;
+			$a = lc( $a );
+
+			if( $a =~ m/--$temp/i )
+			{
+				$tag = 0;
+				print STDERR "[TXTDUMP] READING [$line] - FOUND BOUNDARY [$bound]\n" if $debug;
+			}
+			else
+			{
+				print STDERR "[TXTDUMP] Line [$line] [$a] does not match boundary [$bound]->[--$temp]\n" if $debug;
+			}
+		}
+		$tag = 0 if $line eq '.';
+
+		next unless $tag;
+
+		if( $transfer =~ m/base64/i )
+		{
+			$line = decode_base64( $line );
+		}
+
+		clean_text( \$line );
+		print STDERR "[TXTDUMP] READING UNTIL END [$line]\n" if $debug;
+
+		# dump the text	
+		$text .= encode( 'utf-8', decode( $charset,  $line ) ) . "\n";
+
+		# we don't want any formatting (removing of control characters, new lines, etc.)
+		$line = read_line(NO_FORMAT);
+	}
+
+	# check if we have a HTML document for special parsing
+	if( $type eq 'HTML' )
+	{
+		# formatting for HTML (the option for later improvments)
+		# for now, this is the same as text treatment, may change in the future
+		$msg .= $text;
+	}
+	else
+	{
+		# plain text, so we will change few characters to format the text better
+		clean_text( \$text );
+		
+		$msg .= $text;
+	}
+
+	# and now to print the message
+	print TF $text;
+	close( TF );
+
+	return 1;
+}
+
+sub decode_text($)
+{
+	my $t = shift;
+	my $name;
+	my ($before,$after);
+	my $code;
+
+	$before = '';
+	$after = '';
+
+	# check if the file name is encoded
+	if( $$t =~ m/=\?(.+)\?b\?(.+)\?=/i )
+	{
+		print STDERR "[DECODE] We are about to clean text (base64) [$$t]\n" if $debug;
+		$name = decode_base64($2);
+		clean_text( \$name );
+		$code = $1;
+
+		# check if there is any text outside of the "scope"
+		if( $$t =~ m/^(.+)=\?.+\?b\?.+\?=(.+)$/i )
+		{
+			$before = $1;
+			$after = $2;
+		}
+
+		$$t = $before .  encode( 'utf-8', decode( $code, $name ) ) . $after ;
+	}
+	
+	
+	if( $$t =~ m/=\?(.+)\?q\?(.+)\?=/i )
+	{
+		print STDERR "[DECODE] We are about to clean text [$$t]\n" if $debug;
+		$name = $2;
+		clean_text( \$name );
+		$code = $1;
+
+		# check if there is any text outside of the "scope"
+		if( $$t =~ m/^(.+)=\?.+\?q\?.+\?=(.+)$/i )
+		{
+			$before = $1;
+			$after = $2;
+		}
+
+		$$t = $before . encode( 'utf-8', decode( $code, $name ) ) . $after;
+
+	}
+}
+
+sub clean_text($)
+{
+	my $t = shift;
+
+	$$t =~ s/=([0-9a-fA-F][0-9a-fA-F])/pack( 'C', hex($1))/egi;
+}
+
+#	dump_cmd
+#
+# A small function that parses the available SMTP commands
+sub dump_cmd()
+{
+	my $w = shift;
+	my $t = shift;
+	my $tag;
+	my $line;
+	my $response;
+	my $res_code;
+	my $i;
+
+	print STDERR  "Command $w issued (" . $smtp_cmd{ $w } . ") with parameter: $t\n" if $debug;
+
+	# check the command against few presets (that have special treatment)
+	if( $w eq 'auth' )
+	{
+		print STDERR "AUTHENTICATION\n" if $debug;
+		return decode_authentication();
+	}
+	elsif( $w eq 'data' )
+	{
+		# we've reached the data part of the message
+
+		# start with the first line
+		return dump_datapart( read_line() );
+	}
+	elsif( $w eq 'mail' )
+	{
+		($i,$info{'mail_from'}) = split( /:/, $t ); 	
+
+		# read the response
+		$line = read_line();
+
+		if( $line !~ m/^250/ )
+		{
+			$info{'mail_from_warning'} = 'Error in mail from. User attempted: ' . $info{'mail_from'} . ' - msg: ' . $line;
+		}
+
+		return read_line();
+	}
+	elsif( $w eq 'rcpt' )
+	{
+		($i,$info{'rcpt_to'}) = split( /:/, $t ); 	
+
+		# read the response
+		$line = read_line();
+
+		if( $line !~ m/^250/ )
+		{
+			$info{'mail_from_warning'} = 'Error in mail from. User attempted: ' . $info{'mail_from'} . ' - msg: ' . $line;
+		}
+
+		return read_line();
+	}
+
+	# if we have reached this part we are dealing with as of this time unsupported SMTP commands (that is that do not
+	# have a special parser as of this version of the code)
+
+	$info{"cmd_$w"}->{cmd} = "CMD: $w $t";
+
+	# read the response (can be several )
+	$tag = 1;
+	while( $tag )
+	{
+		$line = read_line() or return 0;	# we may have reached the end of file
+
+		# check if we have a response code or not
+		$tag = 0 unless $line =~ m/^[0-9]/;
+
+		next unless $tag;
+
+		if( $line =~ m/^[0-9]/ )
+		{
+			$res_code = substr( $line, 0, 3 );
+			$response = substr( $line, 3 );
+	
+			$info{"cmd_$w"}->{$res_code} = $response;
+
+			print STDERR "Response [$res_code] " . $reply_codes{"$res_code"} . " - $response \n" if $debug;
+		}
+	}
+
+	# the last line has to be re-read
+	return $line;
+}
+
+# 	decode_authentication
+#
+# A function to decode SMTP authentication
+#
+sub decode_authentication()
+{
+	my $line;
+	my $tag;
+	my $user = undef;
+	my $pass = undef;
+	my ($a,$b);
+
+	print STDERR "Decoding authentication\n" if $debug;
+
+	$tag = 1;
+	while( $tag )
+	{
+		# read a line (we do care about case)
+		$_ = read_line(CASE_SENSITIVE);
+
+		print STDERR "[AUTH] Examining: $_\n" if $debug;
+
+		# match the first word
+		($a,$b) = split( /\s/, $_ );
+
+		print STDERR "[AUTH] SPLIT ($a) AND ($b)\n" if $debug;
+
+		# check if we have reached a new command (end of auth)
+		$tag = 0 if exists( $smtp_cmd{lc("$a")} );
+
+		next unless $tag;
+
+		# we are still authenticating
+		# the lines are split in two ways, either an input or a response
+		if( /^(\d{3}) (.*)/ )
+		{
+			# a response, or a request for authentication
+
+			# check if we see a known response
+			if( $2 eq 'VXNlcm5hbWU6' )
+			{
+				# base64 encoded request for a username
+				$user =  decode_base64( read_line(CASE_SENSITIVE) );
+				$info{'Username'} = $user;
+			}
+			elsif( $2 eq 'UGFzc3dvcmQ6' )
+			{
+				# base64 encoded request for a password
+				$pass =  decode_base64( read_line(CASE_SENSITIVE) );
+				$info{'Password'} = $pass;
+			}
+			elsif( $2 =~ m/successful/ )
+			{
+				print STDERR "Authentication successful\n" if $debug;
+				$info{'auth_success'} = 'Successfully authenticated';
+			}
+			elsif( $2 =~ m/failed/ )
+			{
+				print STDERR "Authentication failed\n" if $debug;
+				$info{'auth_success'} = 'Authentication failed';
+			}
+			elsif( ( $1 eq 334 ) )
+			{
+				# authentication request (possibly cram-md5?)
+				$info{'auth_line'} = read_line( CASE_SENSITIVE );
+				$info{'auth_line_base_decoded'} = decode_base64( $info{'auth_line'} );
+
+				# check if the username and password are split using space
+				if( lc($info{'auth_line_base_decoded'}) =~ m/(.+)\s(.+)/ )
+				{
+					$user = $1;
+					$pass = $2;
+				}
+				# or the split is done by using 0x00
+				elsif( $info{'auth_line_base_decoded'} =~ m/^\x00(.+)\x00(.+)/ )
+				{
+					$user = $1;
+					$pass = $2;
+				}
+				else
+				{
+					$user = 'unkown';
+					$pass = 'unkown';
+				}
+
+				$info{'Username'} = $user;
+				$info{'Password'} = $pass;
+				
+			}
+			else
+			{
+				# this indicates a unkown authentication mechanism
+				# according to this version of the tool
+#				$user = read_line( NO_FORMAT );
+#				$info{"Auth_msg_$2"} = 'unkown as of this version (' . $user . ')';
+				$info{'auth_leftovers'} = $1 . ' - ' . $2;
+
+				print "Request: [$1] $2\n" if $debug;
+			}
+		
+		}
+		else
+		{
+			# an input
+			print "AUTHENTICATING $_\n" if $debug;
+		}
+	}
+	
+	if( $debug )
+	{
+		print STDERR "User: $user\n" if defined $user;
+		print STDERR "Password: $pass\n" if defined $pass;
+	}
+	
+	return lc( $_ );
+}
+
+# dump attachment
+sub dump_attachment($)
+{
+	my $out = 'a.out';	# default name for output file
+	my $tag;
+	my $line = shift;
+	my $encoding;
+	my $name;
+	my $transfer;
+	my $md5_sum;
+
+	# read the header
+	$tag = 1;
+
+	# we are trying to find the name of the attachment
+	# as well as the encoding
+	while( $tag )
+	{	
+		print STDERR "[ATTACHMENT] Reading $line\n" if $debug;
+		$tag = 0 if $line eq '';
+		next unless $tag;
+
+		if( $line =~ m/name=(.+)/i )
+		{
+			if( $line !~ m/filename/i )
+			{
+				$out = $1;
+				$out =~ s/"//g;
+
+				decode_text( \$out );
+				print STDERR "Filename found: $out\n" if $debug;
+			}
+		}
+
+		if( $line =~ m/Encoding/i )
+		{
+			($line, $encoding) = split( /:/, $line );
+			print STDERR "ENCODING: $encoding\n" if $debug;
+		}
+			
+		if( $line =~ m/Content-transfer-encoding;(.+)/i )
+		{
+			$transfer = $1;
+			$transfer =~ s/\s//g;
+		}
+
+
+		# read a line
+		$line = read_line(CASE_SENSITIVE);
+
+	}
+	print STDERR "[ATTACHMENT] Done reading name and encoding\n" if $debug;
+
+	# go through all empty lines
+	$tag = 1;
+	while( $tag )
+	{
+		$line = read_line(CASE_SENSITIVE);
+
+		$tag = 0 unless $line eq '';
+
+	}
+
+	print STDERR "[ATTACHMENT] Done reading spaces\n" if $debug;
+	
+	if( $out eq 'a.out' )
+	{
+		# the default value for output
+		$out = 'unkown_' . int( rand( 10000 ) ) . '.raw';
+	}	
+	# now we need to read in all of the attachment and write it out
+	open(RW,'>' . $dir . '/' . $msg_nr . '-' . $out );
+
+	$tag = 1;
+	while( $tag )
+	{
+
+		$tag = 0 if $line eq '';
+		$tag = 0 if $line eq '.';
+	
+		foreach my $bound (@boundary)
+		{
+			$tag = 0 if $line =~ m/^--$bound/;
+		}
+
+		next unless $tag;
+
+		print RW decode_base64( $line );
+		$line = read_line(CASE_SENSITIVE);
+	}
+	close(RW);
+
+	# we need to re-open the file to calculate the MD5 sum
+	open(RO, $dir . '/' . $msg_nr . '-' . $out );
+
+	# calulate the MD5 sum
+	my $digest = Digest::MD5->new;
+	$digest->addfile( *RO );
+	$md5_sum = $digest->hexdigest;
+	close(RO);
+
+	# write the MD5 sum to a file
+	open( MD, '>' . $dir . '/' . $msg_nr . '-' . $out . '.md5' );
+	print MD $md5_sum . '  ' . $msg_nr . '-' . $out ."\n";
+	close( MD );
+	
+	$info{'msg'} .=  "Attachment dumped to file - name: $out\n";
+	$info{'msg'} .=  "Attachment MD5: $md5_sum\n";
+
+	print STDERR "[ATTACHMENT] Returning from dump_attachment - line [$line]\n" if $debug;
+	return $line;
+}
+
+sub read_line()
+{
+	my $line;
+	my $option = shift;
+
+	$line = <FH> or return 0;
+
+	# print the raw line into the file
+	print RAW $line;
+
+	return 0 unless $line;
+
+	return $line if $option eq NO_FORMAT;
+
+	# clean the line up
+
+	# remove new line characters
+	$line =~ s/\n//g;
+	$line =~ s/\r//g;
+
+	# return the line if we only want to remove newline characters
+	return $line if $option eq NO_NEWLINE;
+
+	# remove control characters
+	$line =~ s/[[:cntrl:]]//g;
+
+	# return the line in lower case
+	return lc( $line ) unless $option eq CASE_SENSITIVE;
+	
+	# or if we prefer to keep the case, then return the line
+	return $line;
+}
+
+sub show_version()
+{
+	print "$0 version $VERSION\n";
+	exit 0;
+}
+
+__END__
+
+=pod
+
+=head1 NAME
+
+B<sanex> - a Smtp ANalysis and EXtraction tool - a tool to extract information from SMTP conversation 
+
+=head1 SYNOPSIS 
+
+B<sanex> -r|-read [-d|-directory DIR] [-q|-quiet] [-a] FILE 
+
+B<sanex>[ -v|--version] [-h|--help|-?] [-d|-debug]
+
+=head1 OPTIONS
+
+=over 8
+
+=item B<-r|-read FILE >
+
+Read the file containing the SMTP conversation.  This should be a dump file in a text format that contains the entire SMTP conversation.  Tools such as pcapcat can be used to dump the conversation into a text file.
+
+=item B<-q|-quiet>
+
+By default the tool prints out to the screen various information regarding the SMTP conversation, including the message itself. The option of -q, or quiet tells the tool to omit this output, making it ideal to use in other scripts.
+
+=item B<-a|-analyze>
+
+Print debugging information in case the script is not working correctly. Detailed debugging information is dumped to STDERR
+
+=item B<-d|-directory DIR>
+
+Define a directory where to save the exported data.  That is by default the script creates a series of documents, each containing a number followed by a dash (-) and finally the appropriate file name.  The number indicates the message number in the SMTP conversation (starts by 1) and the final part contains:
+
+=over 4
+
+=item B<-> Text.txt
+
+=item B<-> HTML.html
+
+=item B<-> info.txt
+
+=item B<-> The name of the attachment that is contained within the document
+
+=back
+
+This option overwrites the default value of saving these files in the current directory and saves it instead in the directory named DIR (the directory cannot exist prior to calling the script).
+
+=item B<-v|-version>
+
+Dump the version number of the script to the screen and quit
+
+=item B<-h|-help|-?>
+
+Print this help menu
+
+=back
+          
